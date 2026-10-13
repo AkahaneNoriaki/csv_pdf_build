@@ -4,7 +4,7 @@ from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QFont, QFontDatabase, QPageLayout, QPageSize, QTextDocument
 from qgis.PyQt.QtPrintSupport import QPrinter
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QFileDialog, QFontComboBox, QFormLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFontComboBox, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
 )
@@ -20,14 +20,11 @@ ALL_FIELDS = "(全項目)"
 
 
 class ConditionRow(QHBoxLayout):
-    """検索条件 1 行: [区分][項目][演算子][値][削除]"""
+    """検索条件 1 行: [項目][演算子][値][削除]  (項目は検索レイヤのもの)"""
 
     def __init__(self, dialog):
         super().__init__()
         self.dialog = dialog
-        self.source = QComboBox()
-        for s in SOURCES:
-            self.source.addItem(core.SOURCE_LABELS[s], s)
         self.field = QComboBox()
         self.op = QComboBox()
         for k, v in core.OPERATORS.items():
@@ -38,24 +35,23 @@ class ConditionRow(QHBoxLayout):
         self.remove = QPushButton("×")
         self.remove.setMaximumWidth(28)
         self.remove.clicked.connect(lambda: dialog.remove_condition(self))
-        for w in (self.source, self.field, self.op):
-            self.addWidget(w)
-        self.addWidget(self.text, 1)
+        self.addWidget(self.field, 1)
+        self.addWidget(self.op)
+        self.addWidget(self.text, 2)
         self.addWidget(self.remove)
-        self.source.currentIndexChanged.connect(self.update_fields)
         self.update_fields()
 
     def widgets(self):
-        return (self.source, self.field, self.op, self.text, self.remove)
+        return (self.field, self.op, self.text, self.remove)
 
     def update_fields(self):
         self.field.clear()
         self.field.addItem(ALL_FIELDS, None)
-        for n in self.dialog.names.get(self.source.currentData(), []):
+        for n in self.dialog.names.get(self.dialog.search_source(), []):
             self.field.addItem(n, n)
 
     def condition(self):
-        return core.Condition(self.source.currentData(), self.field.currentData(),
+        return core.Condition(self.dialog.search_source(), self.field.currentData(),
                               self.op.currentData(), self.text.text())
 
 
@@ -73,32 +69,63 @@ class MainDialog(QDialog):
 
         root = QVBoxLayout(self)
 
-        # --- レイヤ設定 ---
-        box = QGroupBox("1. レイヤ・リレーション設定")
-        form = QFormLayout(box)
+        # 先に部品を作る (レイヤ設定は 2 番目の枠に置く)
         self.layer_combo = QgsMapLayerComboBox()
         self.layer_combo.setFilters(QgsMapLayerProxyModel.VectorLayer)
         self.detail_combo = QComboBox()
         self.forest_combo = QComboBox()
-        form.addRow("林地台帳レイヤ", self.layer_combo)
-        form.addRow("林地台帳の詳細情報(リレーション)", self.detail_combo)
-        form.addRow("森林簿の詳細情報(リレーション)", self.forest_combo)
         self.selected_only = QComboBox()
         self.selected_only.addItem("全地物", False)
         self.selected_only.addItem("選択中の地物のみ", True)
+
+        # --- 1. 検索 ---
+        box = QGroupBox("1. 検索するレイヤと条件")
+        v = QVBoxLayout(box)
+        h = QHBoxLayout()
+        h.addWidget(QLabel("検索するレイヤ"))
+        self.source_combo = QComboBox()
+        h.addWidget(self.source_combo, 1)
+        v.addLayout(h)
+        self.cond_layout = QVBoxLayout()
+        self.cond_rows = []
+        v.addLayout(self.cond_layout)
+        h = QHBoxLayout()
+        b_add = QPushButton("条件を追加")
+        b_add.clicked.connect(self.add_condition)
+        b_search = QPushButton("検索")
+        b_search.clicked.connect(self.do_search)
+        h.addWidget(b_add)
+        h.addStretch(1)
+        h.addWidget(b_search)
+        v.addLayout(h)
+        root.addWidget(box)
+
+        self.table = QTableWidget()
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        root.addWidget(self.table, 1)
+        self.status = QLabel("")
+        root.addWidget(self.status)
+
+        # --- 2. レイヤ・リレーション設定 ---
+        box = QGroupBox("2. レイヤ・リレーション設定 (通常は自動で設定されます)")
+        form = QFormLayout(box)
+        form.addRow("林地台帳レイヤ", self.layer_combo)
+        form.addRow("林地台帳の詳細情報(リレーション)", self.detail_combo)
+        form.addRow("森林簿の詳細情報(リレーション)", self.forest_combo)
         form.addRow("対象", self.selected_only)
         root.addWidget(box)
 
-        # --- 出力項目 ---
-        box = QGroupBox("2. 出力する項目")
+        # --- 3. 出力項目 ---
+        box = QGroupBox("3. 出力する項目")
         v = QVBoxLayout(box)
         self.tabs = QTabWidget()
         self.field_lists = {}
-        for s in SOURCES:
+        for s_ in SOURCES:
             lw = QListWidget()
-            lw.setMaximumHeight(130)
-            self.field_lists[s] = lw
-            self.tabs.addTab(lw, core.SOURCE_LABELS[s])
+            lw.setMaximumHeight(110)
+            self.field_lists[s_] = lw
+            self.tabs.addTab(lw, core.SOURCE_LABELS[s_])
         v.addWidget(self.tabs)
         h = QHBoxLayout()
         b_all = QPushButton("全選択")
@@ -111,31 +138,11 @@ class MainDialog(QDialog):
         v.addLayout(h)
         root.addWidget(box)
 
-        # --- 検索 ---
-        box = QGroupBox("3. 検索条件 (すべてに一致)")
-        self.cond_layout = QVBoxLayout(box)
-        self.cond_rows = []
-        h = QHBoxLayout()
-        b_add = QPushButton("条件を追加")
-        b_add.clicked.connect(self.add_condition)
-        b_search = QPushButton("検索")
-        b_search.clicked.connect(self.do_search)
-        h.addWidget(b_add)
-        h.addStretch(1)
-        h.addWidget(b_search)
-        self.cond_layout.addLayout(h)
-        root.addWidget(box)
-
-        self.table = QTableWidget()
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        root.addWidget(self.table, 1)
-        self.status = QLabel("")
-        root.addWidget(self.status)
-
-        # --- 出力 ---
+        # --- 4. 出力 ---
         box = QGroupBox("4. 出力 (表の行を選択した場合は選択行のみ、未選択なら検索結果すべて)")
         form = QFormLayout(box)
+        self.only_matched = QCheckBox("検索したレイヤは、一致したレコードのみ出力する")
+        self.only_matched.setChecked(True)
         self.enc_combo = QComboBox()
         for k, v_ in core.ENCODINGS.items():
             self.enc_combo.addItem(v_, k)
@@ -143,10 +150,11 @@ class MainDialog(QDialog):
         self.font_combo.setCurrentFont(QFont(self.default_font()))
         self.title_edit = QLineEdit("林地台帳 出力")
         self.title_field = QComboBox()
+        form.addRow(self.only_matched)
         form.addRow("CSV 文字コード", self.enc_combo)
         form.addRow("PDF フォント", self.font_combo)
         form.addRow("PDF タイトル", self.title_edit)
-        form.addRow("PDF 見出しに使う林地台帳項目", self.title_field)
+        form.addRow("PDF 見出し・結果表に使う林地台帳項目", self.title_field)
         h = QHBoxLayout()
         b_csv = QPushButton("CSV 出力")
         b_pdf = QPushButton("PDF 出力")
@@ -161,6 +169,7 @@ class MainDialog(QDialog):
         self.layer_combo.layerChanged.connect(self.on_layer_changed)
         self.detail_combo.currentIndexChanged.connect(self.on_relation_changed)
         self.forest_combo.currentIndexChanged.connect(self.on_relation_changed)
+        self.source_combo.currentIndexChanged.connect(self.on_source_changed)
         self.add_condition()
 
     # ---------- 設定 ----------
@@ -212,6 +221,7 @@ class MainDialog(QDialog):
                 it.setFlags(it.flags() | ITEM_CHECKABLE)
                 it.setCheckState(CHECKED)
                 lw.addItem(it)
+        self.update_source_combo(layer, rels)
         self.title_field.clear()
         self.title_field.addItem("(なし)", None)
         for n in self.names[core.SRC_PARENT]:
@@ -219,6 +229,29 @@ class MainDialog(QDialog):
         for row in self.cond_rows:
             row.update_fields()
         self.results, self.hits = [], []
+        self.show_hits()
+
+    def update_source_combo(self, layer, rels):
+        """検索レイヤの選択肢を、実際に使えるレイヤ名で作り直す。"""
+        keep = self.source_combo.currentData()
+        self.source_combo.blockSignals(True)
+        self.source_combo.clear()
+        if layer is not None:
+            self.source_combo.addItem("林地台帳: %s" % layer.name(), core.SRC_PARENT)
+        for s_, label in ((core.SRC_DETAIL, "林地台帳詳細"), (core.SRC_FOREST, "森林簿詳細")):
+            if rels[s_] is not None:
+                self.source_combo.addItem("%s: %s" % (label, rels[s_].referencingLayer().name()), s_)
+        i = self.source_combo.findData(keep)
+        self.source_combo.setCurrentIndex(max(i, 0))
+        self.source_combo.blockSignals(False)
+
+    def search_source(self):
+        return self.source_combo.currentData() or core.SRC_PARENT
+
+    def on_source_changed(self, *_):
+        for row in self.cond_rows:
+            row.update_fields()
+        self.hits = []
         self.show_hits()
 
     def set_all_checked(self, on):
@@ -258,26 +291,35 @@ class MainDialog(QDialog):
         self.results = qgis_data.load_results(
             layer, self.relation(self.detail_combo), self.relation(self.forest_combo),
             self.selected_only.currentData())
-        self.hits = core.search(self.results, [r.condition() for r in self.cond_rows])
+        self.hits = core.search_records(self.results, self.search_source(),
+                                        [r.condition() for r in self.cond_rows])
         self.show_hits()
 
+    def parent_label(self, res):
+        names = self.names[core.SRC_PARENT]
+        key = self.title_field.currentData() or (names[0] if names else None)
+        return res.parent.get(key, "") if key else ""
+
     def show_hits(self):
-        cols = self.checked_fields()[core.SRC_PARENT][:12]
-        headers = cols + ["詳細件数", "森林簿件数"]
+        src = self.search_source()
+        cols = self.checked_fields()[src][:12]
+        headers = (["林地台帳"] if src != core.SRC_PARENT else []) + cols
         self.table.clear()
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         self.table.setRowCount(len(self.hits))
-        for r, res in enumerate(self.hits):
-            vals = [res.parent.get(c, "") for c in cols] + [str(len(res.detail)), str(len(res.forest))]
+        for r, h in enumerate(self.hits):
+            vals = ([self.parent_label(h.result)] if src != core.SRC_PARENT else []) \
+                + [h.record.get(c, "") for c in cols]
             for c, val in enumerate(vals):
                 self.table.setItem(r, c, QTableWidgetItem(val))
         self.table.resizeColumnsToContents()
-        self.status.setText("検索結果: %d 件 / 全 %d 件" % (len(self.hits), len(self.results)))
+        self.status.setText("検索結果: %d 件 (%s)" % (len(self.hits), self.source_combo.currentText()))
 
     def target_results(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()})
-        res = [self.hits[r] for r in rows] if rows else self.hits
+        hits = [self.hits[r] for r in rows] if rows else self.hits
+        res = core.group_hits(hits, self.only_matched.isChecked())
         if not res:
             QMessageBox.information(self, "林地台帳 CSV/PDF 出力", "出力対象がありません。先に検索してください。")
         return res

@@ -100,6 +100,56 @@ def search(results, conditions):
     return [r for r in results if result_matches(r, conditions)]
 
 
+class Hit:
+    """検索レイヤ上で条件に一致した 1 レコード (result.records(source)[index])。"""
+
+    def __init__(self, result, source, index):
+        self.result = result
+        self.source = source
+        self.index = index
+
+    @property
+    def record(self):
+        return self.result.records(self.source)[self.index]
+
+
+def search_records(results, source, conditions):
+    """検索レイヤ(source)のレコード単位で、全条件(AND)に一致するものを返す。"""
+    active = [c for c in conditions if c.text]
+    hits = []
+    for res in results:
+        for i, rec in enumerate(res.records(source)):
+            if all(record_matches(rec, c.field, c.op, c.text) for c in active):
+                hits.append(Hit(res, source, i))
+    return hits
+
+
+def group_hits(hits, only_matched=True):
+    """Hit を林地台帳ごとにまとめた Result のリストにする (出力用)。
+
+    検索レイヤが詳細/森林簿で only_matched=True なら、そのレイヤの
+    子レコードを一致したものだけに絞る。
+    """
+    order, picked = [], {}
+    for h in hits:
+        key = id(h.result)
+        if key not in picked:
+            picked[key] = (h.result, h.source, [])
+            order.append(key)
+        picked[key][2].append(h.index)
+    out = []
+    for key in order:
+        res, source, idxs = picked[key]
+        if source == SRC_PARENT or not only_matched:
+            out.append(res)
+            continue
+        kept = [res.records(source)[i] for i in idxs]
+        out.append(Result(res.parent,
+                          kept if source == SRC_DETAIL else res.detail,
+                          kept if source == SRC_FOREST else res.forest))
+    return out
+
+
 def _pick(record, fields):
     return OrderedDict((f, record.get(f, "")) for f in fields)
 

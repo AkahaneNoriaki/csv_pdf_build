@@ -44,6 +44,17 @@ class CoreTest(unittest.TestCase):
         with open(p, encoding="cp932", newline="") as fp:
             self.assertEqual(len(list(csv.reader(fp))), 5)
 
+    def test_search_records_and_group(self):
+        data = sample()
+        hits = core.search_records(data, core.SRC_DETAIL,
+                                   [core.Condition(core.SRC_DETAIL, "地目", "equals", "山林")])
+        self.assertEqual([(h.result.parent["地番"], h.index) for h in hits],
+                         [("１２３番", 0), ("456番", 1)])
+        out = core.group_hits(hits)
+        self.assertEqual([len(r.detail) for r in out], [1, 1])
+        self.assertEqual(out[1].detail[0]["面積"], "2")
+        self.assertEqual(len(core.group_hits(hits, only_matched=False)[1].detail), 2)
+
     def test_html(self):
         f = {core.SRC_PARENT: ["地番"], core.SRC_FOREST: ["樹種"]}
         html = core.build_html(sample(), f, title_field="地番")
