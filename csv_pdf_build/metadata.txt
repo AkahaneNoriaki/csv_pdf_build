@@ -1,0 +1,13 @@
+[general]
+name=林地台帳 CSV/PDF 出力
+qgisMinimumVersion=3.16
+description=リレーションされた林地台帳レイヤと Excel(林地台帳詳細・森林簿詳細)を検索し、CSV/PDF に出力します
+version=0.1.0
+author=akahanenoriaki
+email=akahane.noriaki@gmail.com
+about=林地台帳レイヤにプロジェクトのリレーションで関連付けた Excel テーブル(林地台帳の詳細情報・森林簿の詳細情報)を横断検索し、結果を CSV または PDF に出力します。
+repository=https://github.com/akahanenoriaki/csv_pdf_build
+tracker=https://github.com/akahanenoriaki/csv_pdf_build/issues
+tags=csv,pdf,forestry,林地台帳,森林簿
+category=Vector
+experimental=True
