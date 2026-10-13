@@ -33,18 +33,41 @@ def feature_record(feature, names):
     return OrderedDict((n, to_text(feature[n])) for n in names)
 
 
+def _key(feature, names):
+    return tuple(to_text(feature[n]).strip() for n in names)
+
+
+def _children_by_key(relation):
+    """子レイヤを 1 回だけ走査して、親キーごとにレコードをまとめる。
+
+    relation.getRelatedFeatures() を親ごとに呼ぶと、親の件数 x 子の件数の
+    検索になり (特に Excel は索引が無い)、極端に遅くなるため使わない。
+    """
+    layer = relation.referencingLayer()
+    pairs = relation.fieldPairs()          # {子の項目: 親の項目}
+    child_fields = list(pairs.keys())
+    names = field_names(layer)
+    groups = {}
+    request = QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry)
+    for c in layer.getFeatures(request):
+        groups.setdefault(_key(c, child_fields), []).append(feature_record(c, names))
+    return groups, [pairs[k] for k in child_fields]
+
+
 def load_results(parent_layer, rel_detail, rel_forest, selected_only=False):
-    """林地台帳の全地物と、リレーション先レコードを読み込む。"""
+    """林地台帳の地物と、リレーション先レコードを読み込む (各レイヤ 1 回の走査)。"""
     pnames = field_names(parent_layer)
-    dnames = field_names(rel_detail.referencingLayer()) if rel_detail else []
-    fnames = field_names(rel_forest.referencingLayer()) if rel_forest else []
+    rels = []
+    for rel in (rel_detail, rel_forest):
+        rels.append(_children_by_key(rel) if rel else ({}, []))
     if selected_only:
-        feats = parent_layer.getSelectedFeatures()
+        feats = parent_layer.getSelectedFeatures(QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry))
     else:
-        feats = parent_layer.getFeatures(QgsFeatureRequest())
+        feats = parent_layer.getFeatures(QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry))
     results = []
     for f in feats:
-        detail = [feature_record(c, dnames) for c in rel_detail.getRelatedFeatures(f)] if rel_detail else []
-        forest = [feature_record(c, fnames) for c in rel_forest.getRelatedFeatures(f)] if rel_forest else []
-        results.append(Result(feature_record(f, pnames), detail, forest))
+        lists = []
+        for groups, parent_fields in rels:
+            lists.append(groups.get(_key(f, parent_fields), []) if parent_fields else [])
+        results.append(Result(feature_record(f, pnames), lists[0], lists[1]))
     return results

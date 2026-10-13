@@ -4,7 +4,7 @@ from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QFont, QFontDatabase, QPageLayout, QPageSize, QTextDocument
 from qgis.PyQt.QtPrintSupport import QPrinter
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFontComboBox, QFormLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFontComboBox, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
 )
@@ -61,7 +61,8 @@ class MainDialog(QDialog):
         self.iface = iface
         self.setWindowTitle("林地台帳 CSV/PDF 出力")
         self.resize(900, 720)
-        self.results = []      # 全件
+        self.results = []      # 全件 (読み込み済みキャッシュ)
+        self._cache_key = None
         self.hits = []         # 検索結果
         self.names = {s: [] for s in SOURCES}
         self.rows = []
@@ -183,6 +184,7 @@ class MainDialog(QDialog):
         return QFont().family()
 
     def refresh_layers(self):
+        self.results = []  # 開き直したときは最新データを読み直す
         self.on_layer_changed(self.layer_combo.currentLayer())
 
     def on_layer_changed(self, layer):
@@ -288,9 +290,23 @@ class MainDialog(QDialog):
         if layer is None:
             QMessageBox.warning(self, "林地台帳 CSV/PDF 出力", "林地台帳レイヤを選択してください。")
             return
-        self.results = qgis_data.load_results(
-            layer, self.relation(self.detail_combo), self.relation(self.forest_combo),
-            self.selected_only.currentData())
+        cache_key = (layer.id(), self.detail_combo.currentData(),
+                     self.forest_combo.currentData(), self.selected_only.currentData())
+        if self.results and self._cache_key == cache_key and not self.selected_only.currentData():
+            pass  # 同じ設定なら読み込み済みデータで検索 (再読込しない)
+        else:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.status.setText("データを読み込み中...")
+            QApplication.processEvents()
+            try:
+                self.results = qgis_data.load_results(
+                    layer, self.relation(self.detail_combo), self.relation(self.forest_combo),
+                    self.selected_only.currentData())
+                self._cache_key = cache_key
+            finally:
+                QApplication.restoreOverrideCursor()
+        self.status.setText("検索中...")
+        QApplication.processEvents()
         self.hits = core.search_records(self.results, self.search_source(),
                                         [r.condition() for r in self.cond_rows])
         self.show_hits()
