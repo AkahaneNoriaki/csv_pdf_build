@@ -1,0 +1,2 @@
+# csv_pdf_build
+qgisの属性テーブルを検索し､指定した値のcsvやpdfを作成するプラグイン
