@@ -4,7 +4,10 @@
 検索対象(source)は SRC_PARENT / SRC_ALL / 各リレーションの ID。
 """
 import csv
+import datetime
+import re
 import unicodedata
+from functools import lru_cache
 from collections import OrderedDict
 from html import escape
 
@@ -17,7 +20,49 @@ OPERATORS = OrderedDict([
     ("startswith", "で始まる"),
     ("endswith", "で終わる"),
     ("not_contains", "を含まない"),
+    ("date_from", "(日付) 以降"),
+    ("date_to", "(日付) 以前"),
+    ("date_equals", "(日付) と同じ"),
 ])
+
+DATE_OPS = ("date_from", "date_to", "date_equals")
+
+# 和暦の元年の西暦 - 1 (令和6年 -> 2018 + 6)
+ERAS = {"令和": 2018, "平成": 1988, "昭和": 1925, "大正": 1911, "明治": 1867,
+        "R": 2018, "H": 1988, "S": 1925, "T": 1911, "M": 1867}
+_ERA_RE = re.compile(r"(令和|平成|昭和|大正|明治|[RHSTM])\s*\.?\s*(元|\d+)\s*(?:年|[./-])\s*(\d{1,2})"
+                     r"\s*(?:月|[./-])?\s*(?:(\d{1,2})\s*日?)?")
+_WEST_RE = re.compile(r"(\d{4})\s*(?:年|[./-])\s*(\d{1,2})\s*(?:月|[./-])?\s*(?:(\d{1,2})\s*日?)?")
+
+
+@lru_cache(maxsize=65536)
+def parse_date(text):
+    """和暦(令和6年5月1日, R6.5.1)・西暦(2024/5/1, 2024年5月1日)を date にする。
+
+    日が無い場合は 1 日として扱う。読み取れなければ None。
+    """
+    t = unicodedata.normalize("NFKC", str(text)).upper().strip()
+    m = _ERA_RE.search(t)
+    if m:
+        era, y, mo, d = m.group(1), m.group(2), m.group(3), m.group(4)
+        year = ERAS[era] + (1 if y == "元" else int(y))
+    else:
+        m = _WEST_RE.search(t)
+        if not m:
+            return None
+        year, mo, d = int(m.group(1)), m.group(2), m.group(3)
+    try:
+        return datetime.date(year, int(mo), int(d) if d else 1)
+    except ValueError:
+        return None
+
+
+def condition_error(conditions):
+    """検索前の入力チェック。問題があればメッセージを返す。"""
+    for c in conditions:
+        if c.text and c.op in DATE_OPS and parse_date(c.text) is None:
+            return "日付を読み取れません: %s\n(例: 令和6年4月1日 / R6.4.1 / 2024-04-01)" % c.text
+    return None
 
 ENCODINGS = OrderedDict([
     ("utf-8-sig", "UTF-8 (BOM付き・Excel向け)"),
@@ -41,6 +86,7 @@ class Result:
     def __init__(self, parent, children=None):
         self.parent = parent
         self.children = children or {}
+        self.fid = None   # 親レイヤの地物 ID (地図で選択するため)
 
     def records(self, source):
         if source == SRC_PARENT:
@@ -71,8 +117,17 @@ def value_matches(value, op, text):
     return t in v
 
 
+def date_matches(value, op, text):
+    v, t = parse_date(value), parse_date(text)
+    if v is None or t is None:
+        return False
+    return v >= t if op == "date_from" else v <= t if op == "date_to" else v == t
+
+
 def record_matches(record, field, op, text):
     values = list(record.values()) if field is None else [record.get(field, "")]
+    if op in DATE_OPS:
+        return any(date_matches(v, op, text) for v in values)
     if op == "not_contains":
         return all(value_matches(v, op, text) for v in values)
     return any(value_matches(v, op, text) for v in values)

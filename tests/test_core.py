@@ -60,6 +60,33 @@ class CoreTest(unittest.TestCase):
         with open(p, encoding="cp932", newline="") as fp:
             self.assertEqual(len(list(csv.reader(fp))), 5)
 
+    def test_parse_date(self):
+        import datetime as dt
+        p = core.parse_date
+        self.assertEqual(p("令和6年5月1日"), dt.date(2024, 5, 1))
+        self.assertEqual(p("令和元年5月1日"), dt.date(2019, 5, 1))
+        self.assertEqual(p("平成３０年４月３０日"), dt.date(2018, 4, 30))
+        self.assertEqual(p("昭和63年12月31日"), dt.date(1988, 12, 31))
+        self.assertEqual(p("R6.5.1"), dt.date(2024, 5, 1))
+        self.assertEqual(p("2024/5/1"), dt.date(2024, 5, 1))
+        self.assertEqual(p("2024-05-01T10:00:00"), dt.date(2024, 5, 1))
+        self.assertEqual(p("令和6年5月"), dt.date(2024, 5, 1))
+        self.assertIsNone(p("山林"))
+        self.assertIsNone(p("令和6年13月1日"))
+
+    def test_date_search(self):
+        data = [core.Result(O(氏名="A", 更新日="令和6年4月1日")),
+                core.Result(O(氏名="B", 更新日="令和6年6月30日")),
+                core.Result(O(氏名="C", 更新日="平成30年1月1日")),
+                core.Result(O(氏名="D", 更新日=""))]
+        rng = [cond("更新日", "date_from", "2024-04-01"), cond("更新日", "date_to", "令和6年6月30日")]
+        got = core.search_records(data, core.SRC_PARENT, rng)
+        self.assertEqual([h.record["氏名"] for h in got], ["A", "B"])
+        eq = core.search_records(data, core.SRC_PARENT, [cond("更新日", "date_equals", "H30.1.1")])
+        self.assertEqual([h.record["氏名"] for h in eq], ["C"])
+        self.assertIsNotNone(core.condition_error([cond("更新日", "date_from", "あ")]))
+        self.assertIsNone(core.condition_error(rng))
+
     def test_html(self):
         f = {core.SRC_PARENT: ["地番"], F: ["樹種"]}
         html = core.build_html(sample(), f, LABELS, title_field="地番")

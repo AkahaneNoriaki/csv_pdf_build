@@ -93,7 +93,9 @@ def load_results(parent_layer, relations, selected_only=False, progress=None):
     for f in feats:
         tick()
         children = {rid: groups.get(_key(f, pf), []) for rid, groups, pf in rels}
-        results.append(Result(feature_record(f, pnames), children))
+        res = Result(feature_record(f, pnames), children)
+        res.fid = f.id()
+        results.append(res)
     if progress:
         progress(total, total)
     return results

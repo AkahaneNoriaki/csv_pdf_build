@@ -31,7 +31,7 @@ class ConditionRow(QHBoxLayout):
         for k, v in core.OPERATORS.items():
             self.op.addItem(v, k)
         self.text = QLineEdit()
-        self.text.setPlaceholderText("検索値 (例: 氏名)")
+        self.text.setPlaceholderText("検索値 (例: 氏名 / 令和6年4月1日)")
         self.text.returnPressed.connect(dialog.do_search)
         self.remove = QPushButton("×")
         self.remove.setMaximumWidth(28)
@@ -66,7 +66,8 @@ class MainDialog(QDialog):
         self.labels = OrderedDict()                 # source -> 表示名 (親が先頭)
         self.names = {core.SRC_PARENT: []}          # source -> 項目名リスト
         self.results = []                           # 読み込み済み全件
-        self.hits = []                              # 検索結果
+        self.hits = []                              # 検索結果 (Hit)
+        self.rows = []                              # 表の各行 = Hit のリスト
 
         root = QVBoxLayout(self)
 
@@ -86,10 +87,15 @@ class MainDialog(QDialog):
         b_add.clicked.connect(self.add_condition)
         b_search = QPushButton("検索")
         b_search.clicked.connect(self.do_search)
+        self.parent_view = QCheckBox("結果を親レイヤの行で表示")
+        self.parent_view.setChecked(True)
+        self.parent_view.toggled.connect(self.on_view_changed)
         h.addWidget(b_add)
+        h.addWidget(self.parent_view)
         h.addStretch(1)
         h.addWidget(b_search)
         v.addLayout(h)
+        v.addWidget(QLabel("日付は「(日付) 以降/以前/と同じ」で指定。令和6年4月1日・R6.4.1・2024-04-01 の形式で入力できます"))
         root.addWidget(box)
 
         self.table = QTableWidget()
@@ -103,8 +109,14 @@ class MainDialog(QDialog):
         self.progress.setVisible(False)
         b_reload = QPushButton("データ再読込")
         b_reload.clicked.connect(self.load_data)
+        b_sel = QPushButton("地図で選択")
+        b_zoom = QPushButton("選択して拡大")
+        b_sel.clicked.connect(lambda: self.select_on_map(False))
+        b_zoom.clicked.connect(lambda: self.select_on_map(True))
         h.addWidget(self.status, 1)
         h.addWidget(self.progress)
+        h.addWidget(b_sel)
+        h.addWidget(b_zoom)
         h.addWidget(b_reload)
         root.addLayout(h)
 
@@ -319,10 +331,14 @@ class MainDialog(QDialog):
         if self.parent_layer is None:
             QMessageBox.warning(self, TITLE, "リレーション済みのレイヤを選択してください。")
             return
+        conds = [r.condition() for r in self.cond_rows]
+        err = core.condition_error(conds)
+        if err:
+            QMessageBox.warning(self, TITLE, err)
+            return
         if not self.results:
             self.load_data()
-        self.hits = core.search_records(self.results, self.search_source(),
-                                        [r.condition() for r in self.cond_rows])
+        self.hits = core.search_records(self.results, self.search_source(), conds)
         self.show_hits()
 
     def parent_label(self, res):
@@ -330,31 +346,65 @@ class MainDialog(QDialog):
         key = self.title_field.currentData() or (names[0] if names else None)
         return res.parent.get(key, "") if key else ""
 
-    def show_hits(self):
+    def on_view_changed(self, *_):
+        self.show_hits()
+
+    def build_rows(self):
+        """表の行を作る。リレーション先を検索して親の行で表示するときは、親ごとにまとめる。"""
         src = self.search_source()
-        shown = core.SRC_PARENT if src == core.SRC_ALL else src   # 横断検索は親の行を表示
+        if self.parent_view.isChecked() and src not in (core.SRC_PARENT, core.SRC_ALL):
+            groups = OrderedDict()
+            for h in self.hits:
+                groups.setdefault(id(h.result), []).append(h)
+            self.rows = list(groups.values())
+        else:
+            self.rows = [[h] for h in self.hits]
+
+    def show_hits(self):
+        self.build_rows()
+        src = self.search_source()
+        by_parent = src in (core.SRC_PARENT, core.SRC_ALL) or self.parent_view.isChecked()
+        shown = core.SRC_PARENT if by_parent else src
+        counted = by_parent and src not in (core.SRC_PARENT, core.SRC_ALL)
         cols = (self.checked_fields().get(shown) or self.names.get(shown, []))[:12]
-        headers = (["親レイヤ"] if shown != core.SRC_PARENT else []) + cols
+        headers = (["親レイヤ"] if not by_parent else []) + cols + (["一致件数"] if counted else [])
         self.table.clear()
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
-        self.table.setRowCount(len(self.hits))
-        for r, h in enumerate(self.hits):
-            vals = ([self.parent_label(h.result)] if shown != core.SRC_PARENT else []) \
-                + [h.record.get(c, "") for c in cols]
+        self.table.setRowCount(len(self.rows))
+        for r, row in enumerate(self.rows):
+            first = row[0]
+            rec = first.result.parent if shown == core.SRC_PARENT else first.record
+            vals = ([self.parent_label(first.result)] if not by_parent else []) \
+                + [rec.get(c, "") for c in cols] + ([str(len(row))] if counted else [])
             for c, val in enumerate(vals):
                 self.table.setItem(r, c, QTableWidgetItem(val))
         self.table.resizeColumnsToContents()
         if self.hits or self.results:
-            self.status.setText("検索結果: %d 件 (%s)" % (len(self.hits), self.source_combo.currentText()))
+            self.status.setText("検索結果: %d 件 (%s)" % (len(self.rows), self.source_combo.currentText()))
+
+    def target_hits(self):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        chosen = [self.rows[r] for r in rows] if rows else self.rows
+        return [h for row in chosen for h in row]
 
     def target_results(self):
-        rows = sorted({i.row() for i in self.table.selectedIndexes()})
-        hits = [self.hits[r] for r in rows] if rows else self.hits
-        res = core.group_hits(hits, self.only_matched.isChecked())
+        res = core.group_hits(self.target_hits(), self.only_matched.isChecked())
         if not res:
             QMessageBox.information(self, TITLE, "出力対象がありません。先に検索してください。")
         return res
+
+    def select_on_map(self, zoom):
+        """検索結果の親レイヤの地物を QGIS 上で選択する (表の行を選んでいればその行だけ)。"""
+        results = core.group_hits(self.target_hits(), False)
+        fids = [r.fid for r in results if r.fid is not None]
+        if not fids or self.parent_layer is None:
+            QMessageBox.information(self, TITLE, "選択対象がありません。先に検索してください。")
+            return
+        self.parent_layer.selectByIds(fids)
+        if zoom:
+            self.iface.mapCanvas().zoomToSelected(self.parent_layer)
+        self.iface.messageBar().pushSuccess("地図で選択", "%s: %d 件を選択しました" % (self.parent_layer.name(), len(fids)))
 
     # ---------- 出力 ----------
     def export_csv(self):
