@@ -1,12 +1,14 @@
-from qgis.core import QgsMapLayerProxyModel
-from qgis.gui import QgsMapLayerComboBox
+from collections import OrderedDict
+
+from qgis.core import QgsProject
 from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtGui import QFont, QFontDatabase, QPageLayout, QPageSize, QTextDocument
 from qgis.PyQt.QtPrintSupport import QPrinter
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFontComboBox, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QProgressBar, QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
+    QFontComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QTableWidget,
+    QTableWidgetItem, QTabWidget, QVBoxLayout,
 )
 
 from . import core, qgis_data
@@ -14,13 +16,12 @@ from . import core, qgis_data
 ITEM_CHECKABLE = Qt.ItemFlag.ItemIsUserCheckable
 CHECKED = Qt.CheckState.Checked
 UNCHECKED = Qt.CheckState.Unchecked
-SOURCES = (core.SRC_PARENT, core.SRC_DETAIL, core.SRC_FOREST)
-NO_USE = "(使用しない)"
 ALL_FIELDS = "(全項目)"
+TITLE = "林地台帳 CSV/PDF 出力"
 
 
 class ConditionRow(QHBoxLayout):
-    """検索条件 1 行: [項目][演算子][値][削除]  (項目は検索レイヤのもの)"""
+    """検索条件 1 行: [項目][演算子][値][削除]  (項目は検索するレイヤのもの)"""
 
     def __init__(self, dialog):
         super().__init__()
@@ -30,7 +31,7 @@ class ConditionRow(QHBoxLayout):
         for k, v in core.OPERATORS.items():
             self.op.addItem(v, k)
         self.text = QLineEdit()
-        self.text.setPlaceholderText("検索値")
+        self.text.setPlaceholderText("検索値 (例: 氏名)")
         self.text.returnPressed.connect(dialog.do_search)
         self.remove = QPushButton("×")
         self.remove.setMaximumWidth(28)
@@ -51,35 +52,26 @@ class ConditionRow(QHBoxLayout):
             self.field.addItem(n, n)
 
     def condition(self):
-        return core.Condition(self.dialog.search_source(), self.field.currentData(),
-                              self.op.currentData(), self.text.text())
+        return core.Condition(self.field.currentData(), self.op.currentData(), self.text.text())
 
 
 class MainDialog(QDialog):
     def __init__(self, iface, parent=None):
         super().__init__(parent)
         self.iface = iface
-        self.setWindowTitle("林地台帳 CSV/PDF 出力")
+        self.setWindowTitle(TITLE)
         self.resize(900, 720)
-        self.results = []      # 全件 (読み込み済みキャッシュ)
-        self.hits = []         # 検索結果
-        self.names = {s: [] for s in SOURCES}
-        self.rows = []
+        self.parent_layer = None
         self.relations = []
+        self.labels = OrderedDict()                 # source -> 表示名 (親が先頭)
+        self.names = {core.SRC_PARENT: []}          # source -> 項目名リスト
+        self.results = []                           # 読み込み済み全件
+        self.hits = []                              # 検索結果
 
         root = QVBoxLayout(self)
 
-        # 先に部品を作る (レイヤ設定は 2 番目の枠に置く)
-        self.layer_combo = QgsMapLayerComboBox()
-        self.layer_combo.setFilters(QgsMapLayerProxyModel.VectorLayer)
-        self.detail_combo = QComboBox()
-        self.forest_combo = QComboBox()
-        self.selected_only = QComboBox()
-        self.selected_only.addItem("全地物", False)
-        self.selected_only.addItem("選択中の地物のみ", True)
-
         # --- 1. 検索 ---
-        box = QGroupBox("1. 検索するレイヤと条件")
+        box = QGroupBox("1. 検索 (検索するレイヤを選んで条件を入力)")
         v = QVBoxLayout(box)
         h = QHBoxLayout()
         h.addWidget(QLabel("検索するレイヤ"))
@@ -116,12 +108,17 @@ class MainDialog(QDialog):
         h.addWidget(b_reload)
         root.addLayout(h)
 
-        # --- 2. レイヤ・リレーション設定 ---
-        box = QGroupBox("2. レイヤ・リレーション設定 (通常は自動で設定されます)")
+        # --- 2. 検索レイヤ選択 ---
+        box = QGroupBox("2. 検索レイヤ選択 (選ぶとリレーション先も自動で読み込みます)")
         form = QFormLayout(box)
-        form.addRow("林地台帳レイヤ", self.layer_combo)
-        form.addRow("林地台帳の詳細情報(リレーション)", self.detail_combo)
-        form.addRow("森林簿の詳細情報(リレーション)", self.forest_combo)
+        self.layer_combo = QComboBox()
+        self.related_label = QLabel("")
+        self.related_label.setWordWrap(True)
+        self.selected_only = QComboBox()
+        self.selected_only.addItem("全地物", False)
+        self.selected_only.addItem("選択中の地物のみ", True)
+        form.addRow("リレーション済みレイヤ", self.layer_combo)
+        form.addRow("リレーション先", self.related_label)
         form.addRow("対象", self.selected_only)
         root.addWidget(box)
 
@@ -130,11 +127,6 @@ class MainDialog(QDialog):
         v = QVBoxLayout(box)
         self.tabs = QTabWidget()
         self.field_lists = {}
-        for s_ in SOURCES:
-            lw = QListWidget()
-            lw.setMaximumHeight(110)
-            self.field_lists[s_] = lw
-            self.tabs.addTab(lw, core.SOURCE_LABELS[s_])
         v.addWidget(self.tabs)
         h = QHBoxLayout()
         b_all = QPushButton("全選択")
@@ -150,7 +142,7 @@ class MainDialog(QDialog):
         # --- 4. 出力 ---
         box = QGroupBox("4. 出力 (表の行を選択した場合は選択行のみ、未選択なら検索結果すべて)")
         form = QFormLayout(box)
-        self.only_matched = QCheckBox("検索したレイヤは、一致したレコードのみ出力する")
+        self.only_matched = QCheckBox("リレーション先を検索した場合は、一致したレコードのみ出力する")
         self.only_matched.setChecked(True)
         self.enc_combo = QComboBox()
         for k, v_ in core.ENCODINGS.items():
@@ -163,7 +155,7 @@ class MainDialog(QDialog):
         form.addRow("CSV 文字コード", self.enc_combo)
         form.addRow("PDF フォント", self.font_combo)
         form.addRow("PDF タイトル", self.title_edit)
-        form.addRow("PDF 見出し・結果表に使う林地台帳項目", self.title_field)
+        form.addRow("PDF 見出し・結果表に使う親レイヤの項目", self.title_field)
         h = QHBoxLayout()
         b_csv = QPushButton("CSV 出力")
         b_pdf = QPushButton("PDF 出力")
@@ -175,14 +167,11 @@ class MainDialog(QDialog):
         form.addRow(h)
         root.addWidget(box)
 
-        self.layer_combo.layerChanged.connect(self.on_layer_changed)
-        self.detail_combo.currentIndexChanged.connect(self.on_relation_changed)
-        self.forest_combo.currentIndexChanged.connect(self.on_relation_changed)
+        self.layer_combo.currentIndexChanged.connect(lambda *_: self.on_layer_changed(load=True))
         self.source_combo.currentIndexChanged.connect(self.on_source_changed)
         self.selected_only.currentIndexChanged.connect(lambda *_: self.load_data())
         self.add_condition()
 
-    # ---------- 設定 ----------
     @staticmethod
     def default_font():
         fams = set(QFontDatabase().families())
@@ -192,46 +181,62 @@ class MainDialog(QDialog):
                 return f
         return QFont().family()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self.load_data)   # 開いたときに最新データを読み込む
+
+    # ---------- レイヤ選択 ----------
     def refresh_layers(self):
-        self.on_layer_changed(self.layer_combo.currentLayer())
+        """リレーションの親になっているレイヤを列挙する (プラグインを開くたびに呼ぶ)。"""
+        keep = self.layer_combo.currentData()
+        self.layer_combo.blockSignals(True)
+        self.layer_combo.clear()
+        for layer in qgis_data.parent_layers():
+            self.layer_combo.addItem(layer.name(), layer.id())
+        self.layer_combo.setCurrentIndex(max(self.layer_combo.findData(keep), 0))
+        self.layer_combo.blockSignals(False)
+        self.on_layer_changed(load=self.isVisible())
+        if not self.layer_combo.count():
+            self.status.setText("リレーションが設定されたレイヤがありません。"
+                                "プロジェクトのプロパティ > リレーション で設定してください。")
 
-    def on_layer_changed(self, layer):
+    def on_layer_changed(self, load=False):
+        layer = QgsProject.instance().mapLayer(self.layer_combo.currentData() or "")
+        self.parent_layer = layer
         self.relations = qgis_data.relations_for(layer)
-        for combo in (self.detail_combo, self.forest_combo):
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItem(NO_USE, None)
-            for r in self.relations:
-                combo.addItem("%s → %s" % (r.name(), r.referencingLayer().name()), r.id())
-            combo.blockSignals(False)
-        # 2 つのリレーションがあれば順に仮割り当て
-        if len(self.relations) >= 1:
-            self.detail_combo.setCurrentIndex(1)
-        if len(self.relations) >= 2:
-            self.forest_combo.setCurrentIndex(2)
-        self.on_relation_changed()
+        self.labels = OrderedDict([(core.SRC_PARENT, layer.name() if layer else "")])
+        self.names = {core.SRC_PARENT: qgis_data.field_names(layer)}
+        for r in self.relations:
+            self.labels[r.id()] = qgis_data.relation_label(r)
+            self.names[r.id()] = qgis_data.field_names(r.referencingLayer())
+        self.names[core.SRC_ALL] = []
+        self.related_label.setText("、".join(self.labels[r.id()] for r in self.relations) or "(なし)")
 
-    def relation(self, combo):
-        rid = combo.currentData()
-        return next((r for r in self.relations if r.id() == rid), None)
+        # 検索するレイヤの選択肢
+        keep = self.source_combo.currentData()
+        self.source_combo.blockSignals(True)
+        self.source_combo.clear()
+        self.source_combo.addItem("すべてのレイヤを横断 (氏名など)", core.SRC_ALL)
+        for src, label in self.labels.items():
+            prefix = "親: " if src == core.SRC_PARENT else "リレーション先: "
+            self.source_combo.addItem(prefix + label, src)
+        i = self.source_combo.findData(keep)
+        self.source_combo.setCurrentIndex(max(i, 0))
+        self.source_combo.blockSignals(False)
 
-    def on_relation_changed(self, *_):
-        layer = self.layer_combo.currentLayer()
-        rels = {core.SRC_PARENT: layer,
-                core.SRC_DETAIL: self.relation(self.detail_combo),
-                core.SRC_FOREST: self.relation(self.forest_combo)}
-        for s in SOURCES:
-            src = rels[s]
-            tl = src if s == core.SRC_PARENT else (src.referencingLayer() if src else None)
-            self.names[s] = qgis_data.field_names(tl)
-            lw = self.field_lists[s]
-            lw.clear()
-            for n in self.names[s]:
+        # 出力項目タブ
+        self.tabs.clear()
+        self.field_lists = {}
+        for src, label in self.labels.items():
+            lw = QListWidget()
+            lw.setMaximumHeight(110)
+            for n in self.names[src]:
                 it = QListWidgetItem(n)
                 it.setFlags(it.flags() | ITEM_CHECKABLE)
                 it.setCheckState(CHECKED)
                 lw.addItem(it)
-        self.update_source_combo(layer, rels)
+            self.field_lists[src] = lw
+            self.tabs.addTab(lw, label)
         self.title_field.clear()
         self.title_field.addItem("(なし)", None)
         for n in self.names[core.SRC_PARENT]:
@@ -240,29 +245,11 @@ class MainDialog(QDialog):
             row.update_fields()
         self.results, self.hits = [], []
         self.show_hits()
-        if self.isVisible():
+        if load:
             QTimer.singleShot(0, self.load_data)
 
-    def update_source_combo(self, layer, rels):
-        """検索レイヤの選択肢を、実際に使えるレイヤ名で作り直す。"""
-        keep = self.source_combo.currentData()
-        self.source_combo.blockSignals(True)
-        self.source_combo.clear()
-        if layer is not None:
-            self.source_combo.addItem("林地台帳: %s" % layer.name(), core.SRC_PARENT)
-        for s_, label in ((core.SRC_DETAIL, "林地台帳詳細"), (core.SRC_FOREST, "森林簿詳細")):
-            if rels[s_] is not None:
-                self.source_combo.addItem("%s: %s" % (label, rels[s_].referencingLayer().name()), s_)
-        i = self.source_combo.findData(keep)
-        self.source_combo.setCurrentIndex(max(i, 0))
-        self.source_combo.blockSignals(False)
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        QTimer.singleShot(0, self.load_data)   # 開いたときに最新データを読み込む
-
     def search_source(self):
-        return self.source_combo.currentData() or core.SRC_PARENT
+        return self.source_combo.currentData() or core.SRC_ALL
 
     def on_source_changed(self, *_):
         for row in self.cond_rows:
@@ -271,8 +258,8 @@ class MainDialog(QDialog):
         self.show_hits()
 
     def set_all_checked(self, on):
-        lw = self.field_lists[SOURCES[self.tabs.currentIndex()]]
-        for i in range(lw.count()):
+        lw = self.tabs.currentWidget()
+        for i in range(lw.count() if lw else 0):
             lw.item(i).setCheckState(CHECKED if on else UNCHECKED)
 
     def checked_fields(self):
@@ -298,11 +285,11 @@ class MainDialog(QDialog):
             w.deleteLater()
         self.cond_layout.removeItem(row)
 
-    # ---------- 検索 ----------
+    # ---------- 読み込み・検索 ----------
     def load_data(self):
-        """林地台帳とリレーション先を先にまとめて読み込む (検索はこのデータに対して行う)。"""
-        layer = self.layer_combo.currentLayer()
+        """親レイヤとリレーション先を先にまとめて読み込む (検索はこのデータに対して行う)。"""
         self.results, self.hits = [], []
+        layer = self.parent_layer
         if layer is None:
             self.show_hits()
             return
@@ -319,18 +306,18 @@ class MainDialog(QDialog):
 
         try:
             self.results = qgis_data.load_results(
-                layer, self.relation(self.detail_combo), self.relation(self.forest_combo),
-                self.selected_only.currentData(), progress)
+                layer, self.relations, self.selected_only.currentData(), progress)
         finally:
             QApplication.restoreOverrideCursor()
             self.progress.setVisible(False)
             self.setEnabled(True)
         self.show_hits()
-        self.status.setText("読み込み完了: 林地台帳 %d 件。条件を入れて検索してください。" % len(self.results))
+        self.status.setText("読み込み完了: %s %d 件 (リレーション先 %d レイヤ)。条件を入れて検索してください。"
+                            % (layer.name(), len(self.results), len(self.relations)))
 
     def do_search(self):
-        if self.layer_combo.currentLayer() is None:
-            QMessageBox.warning(self, "林地台帳 CSV/PDF 出力", "林地台帳レイヤを選択してください。")
+        if self.parent_layer is None:
+            QMessageBox.warning(self, TITLE, "リレーション済みのレイヤを選択してください。")
             return
         if not self.results:
             self.load_data()
@@ -345,26 +332,28 @@ class MainDialog(QDialog):
 
     def show_hits(self):
         src = self.search_source()
-        cols = self.checked_fields()[src][:12]
-        headers = (["林地台帳"] if src != core.SRC_PARENT else []) + cols
+        shown = core.SRC_PARENT if src == core.SRC_ALL else src   # 横断検索は親の行を表示
+        cols = (self.checked_fields().get(shown) or self.names.get(shown, []))[:12]
+        headers = (["親レイヤ"] if shown != core.SRC_PARENT else []) + cols
         self.table.clear()
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         self.table.setRowCount(len(self.hits))
         for r, h in enumerate(self.hits):
-            vals = ([self.parent_label(h.result)] if src != core.SRC_PARENT else []) \
+            vals = ([self.parent_label(h.result)] if shown != core.SRC_PARENT else []) \
                 + [h.record.get(c, "") for c in cols]
             for c, val in enumerate(vals):
                 self.table.setItem(r, c, QTableWidgetItem(val))
         self.table.resizeColumnsToContents()
-        self.status.setText("検索結果: %d 件 (%s)" % (len(self.hits), self.source_combo.currentText()))
+        if self.hits or self.results:
+            self.status.setText("検索結果: %d 件 (%s)" % (len(self.hits), self.source_combo.currentText()))
 
     def target_results(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()})
         hits = [self.hits[r] for r in rows] if rows else self.hits
         res = core.group_hits(hits, self.only_matched.isChecked())
         if not res:
-            QMessageBox.information(self, "林地台帳 CSV/PDF 出力", "出力対象がありません。先に検索してください。")
+            QMessageBox.information(self, TITLE, "出力対象がありません。先に検索してください。")
         return res
 
     # ---------- 出力 ----------
@@ -375,11 +364,11 @@ class MainDialog(QDialog):
         path, _ = QFileDialog.getSaveFileName(self, "CSV 保存", "林地台帳.csv", "CSV (*.csv)")
         if not path:
             return
-        header, rows = core.csv_table(res, self.checked_fields())
+        header, rows = core.csv_table(res, self.checked_fields(), self.labels)
         try:
             core.write_csv(path, header, rows, self.enc_combo.currentData())
         except OSError as e:
-            QMessageBox.critical(self, "林地台帳 CSV/PDF 出力", "保存に失敗しました:\n%s" % e)
+            QMessageBox.critical(self, TITLE, "保存に失敗しました:\n%s" % e)
             return
         self.iface.messageBar().pushSuccess("CSV 出力", "%d 行を保存しました: %s" % (len(rows), path))
 
@@ -390,7 +379,7 @@ class MainDialog(QDialog):
         path, _ = QFileDialog.getSaveFileName(self, "PDF 保存", "林地台帳.pdf", "PDF (*.pdf)")
         if not path:
             return
-        html = core.build_html(res, self.checked_fields(), self.title_edit.text(),
+        html = core.build_html(res, self.checked_fields(), self.labels, self.title_edit.text(),
                                self.font_combo.currentFont().family(), self.title_field.currentData())
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)

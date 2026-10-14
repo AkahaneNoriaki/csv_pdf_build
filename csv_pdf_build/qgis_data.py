@@ -55,13 +55,29 @@ def _children_by_key(relation, tick):
     return groups, [pairs[k] for k in child_fields]
 
 
-def load_results(parent_layer, rel_detail, rel_forest, selected_only=False, progress=None):
-    """林地台帳の地物と、リレーション先レコードを読み込む (各レイヤ 1 回の走査)。
+def parent_layers():
+    """リレーションの親(参照先)になっているレイヤの一覧。"""
+    mgr = QgsProject.instance().relationManager()
+    seen, out = set(), []
+    for r in mgr.relations().values():
+        layer = r.referencedLayer()
+        if r.isValid() and layer is not None and layer.id() not in seen:
+            seen.add(layer.id())
+            out.append(layer)
+    return out
 
+
+def relation_label(relation):
+    return relation.referencingLayer().name()
+
+
+def load_results(parent_layer, relations, selected_only=False, progress=None):
+    """親レイヤの地物と、全リレーション先のレコードを読み込む (各レイヤ 1 回の走査)。
+
+    子レコードは Result.children[relation.id()] に入る。
     progress(done, total) が与えられると、一定件数ごとに呼び出す。
     """
-    total = parent_layer.featureCount() + sum(
-        r.referencingLayer().featureCount() for r in (rel_detail, rel_forest) if r)
+    total = parent_layer.featureCount() + sum(r.referencingLayer().featureCount() for r in relations)
     state = {"done": 0}
 
     def tick():
@@ -70,14 +86,14 @@ def load_results(parent_layer, rel_detail, rel_forest, selected_only=False, prog
             progress(state["done"], total)
 
     pnames = field_names(parent_layer)
-    rels = [_children_by_key(r, tick) if r else ({}, []) for r in (rel_detail, rel_forest)]
+    rels = [(r.id(),) + _children_by_key(r, tick) for r in relations]
     request = QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry)
     feats = parent_layer.getSelectedFeatures(request) if selected_only else parent_layer.getFeatures(request)
     results = []
     for f in feats:
         tick()
-        lists = [groups.get(_key(f, pf), []) if pf else [] for groups, pf in rels]
-        results.append(Result(feature_record(f, pnames), lists[0], lists[1]))
+        children = {rid: groups.get(_key(f, pf), []) for rid, groups, pf in rels}
+        results.append(Result(feature_record(f, pnames), children))
     if progress:
         progress(total, total)
     return results
