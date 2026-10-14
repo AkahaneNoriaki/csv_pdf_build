@@ -17,6 +17,9 @@ class _Req:
     def setFlags(self, _):
         return self
 
+    def setSubsetOfAttributes(self, _):
+        return self
+
     def setFilterFids(self, fids):
         self.fids = set(fids)
         return self
@@ -51,6 +54,11 @@ class Field:
         return self.n
 
 
+class Fields(list):
+    def indexOf(self, name):
+        return next((i for i, f in enumerate(self) if f.name() == name), -1)
+
+
 class Layer:
     def __init__(self, name, fields, feats):
         self._name, self._fields, self.feats = name, fields, feats
@@ -60,7 +68,7 @@ class Layer:
         return self._name
 
     def fields(self):
-        return [Field(n) for n in self._fields]
+        return Fields(Field(n) for n in self._fields)
 
     def selectedFeatureIds(self):
         return []
@@ -144,6 +152,15 @@ class SearchTest(unittest.TestCase):
         self.assertEqual(qgis_data.search(parent, rels, "f", cond), [])
         res = qgis_data.search(parent, rels, core.SRC_PARENT, period)
         self.assertEqual([r.fid for r in res], [2])
+
+    def test_overlay_keys(self):
+        """重ねる図形: 検索結果のキー値から、別レイヤの一致する地物 ID を引ける。"""
+        parent, rels, detail, forest = setup()
+        res = qgis_data.search(parent, rels, "d", [c("氏名", "contains", "佐藤")])
+        keys = core.result_values(res, "f", "樹種")
+        self.assertEqual(keys, {"ヒノキ"})
+        self.assertEqual(dict(qgis_data.key_index(forest, "樹種", keys)), {"ヒノキ": [21]})
+        self.assertEqual(core.result_values(res, core.SRC_PARENT, "地番"), {"2-2"})
 
     def test_no_match_and_scan_counts(self):
         parent, rels, detail, forest = setup()

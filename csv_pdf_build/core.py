@@ -246,6 +246,17 @@ def group_hits(hits, only_matched=True):
     return out
 
 
+def result_values(results, source, field):
+    """Result 群の source レイヤのレコードにある field の値 (空でないもの) の集合。"""
+    out = set()
+    for res in results:
+        for rec in res.records(source):
+            v = rec.get(field, "").strip()
+            if v:
+                out.add(v)
+    return out
+
+
 def csv_table(results, fields, labels):
     """CSV 用の (ヘッダ, 行リスト) を返す。
 

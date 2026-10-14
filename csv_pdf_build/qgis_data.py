@@ -46,6 +46,20 @@ def _request():
     return QgsFeatureRequest().setFlags(flag)
 
 
+def key_index(layer, field, keys=None):
+    """layer の field の値 -> 地物 ID のリスト。keys を渡すと、その値の地物だけを集める。"""
+    idx = layer.fields().indexOf(field)
+    request = _request()
+    if idx >= 0:
+        request.setSubsetOfAttributes([idx])
+    out = defaultdict(list)
+    for f in layer.getFeatures(request):
+        k = to_text(f[field]).strip()
+        if k and (keys is None or k in keys):
+            out[k].append(f.id())
+    return out
+
+
 def parent_layers():
     """リレーションの親(参照先)になっているレイヤの一覧。"""
     mgr = QgsProject.instance().relationManager()

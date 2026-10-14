@@ -2,7 +2,10 @@
 
 1 ページ = 地図 1 枚。対象の地物を赤で強調した一時レイヤを地図の最上位に重ね、地物の範囲に
 ズームする。下部に、林地台帳と紐づくリレーション先(森林簿など)の情報欄を置ける。
+重ねる図形 (Overlay: 施業班など) を指定すると、キーが一致する地物を青で強調して一緒に描く。
 """
+from html import escape
+
 from qgis.core import (
     QgsCoordinateTransform, QgsFeature, QgsFeatureRequest, QgsFillSymbol, QgsLayoutExporter,
     QgsLayoutItemLabel, QgsLayoutItemMap, QgsLayoutItemPage, QgsLayoutItemScaleBar, QgsLayoutPoint,
@@ -29,13 +32,31 @@ def _mm():
     return unit
 
 
+class Overlay:
+    """一緒に描く別の図形レイヤ (施業班など)。
+
+    検索結果の source レイヤの field の値と、layer の key_field の値が一致する地物を描く。
+    """
+
+    def __init__(self, layer, key_field, source, field):
+        self.layer = layer
+        self.key_field = key_field
+        self.source = source
+        self.field = field
+
+    def keys(self, results):
+        return core.result_values(results, self.source, self.field)
+
+
 class Options:
-    def __init__(self, landscape=True, scale=0, show_info=True, font="sans-serif", label_field=None):
+    def __init__(self, landscape=True, scale=0, show_info=True, font="sans-serif", label_field=None,
+                 overlay=None):
         self.landscape = landscape
         self.scale = scale              # 0 = 対象に合わせて自動
         self.show_info = show_info
         self.font = font
         self.label_field = label_field  # 地図上のラベルに使う親レイヤの項目
+        self.overlay = overlay          # Overlay または None
 
 
 class PageSpec:
@@ -91,15 +112,30 @@ class Built:
 
 
 # ---------- 強調表示レイヤ ----------
-def _highlight_layer(parent_layer, fids, label_field, name):
-    """対象の地物だけを複製した一時レイヤ (赤で強調、ラベルつき)。"""
-    wkb = QgsWkbTypes.multiType(QgsWkbTypes.flatType(parent_layer.wkbType()))
+PARCEL_COLOR = (220, 0, 0)     # 林地台帳 (赤)
+OVERLAY_COLOR = (0, 80, 220)   # 重ねる図形 (青)
+
+
+def _symbol(gtype, overlay):
+    r, g, b = OVERLAY_COLOR if overlay else PARCEL_COLOR
+    if gtype == QgsWkbTypes.PolygonGeometry:
+        fill = "%d,%d,%d,40" % (r, g, b) if overlay else "255,235,0,90"
+        return QgsFillSymbol.createSimple({"color": fill, "outline_color": "%d,%d,%d,255" % (r, g, b),
+                                           "outline_width": "0.6" if overlay else "0.8"})
+    if gtype == QgsWkbTypes.LineGeometry:
+        return QgsLineSymbol.createSimple({"color": "%d,%d,%d,255" % (r, g, b), "width": "1.2"})
+    return QgsMarkerSymbol.createSimple({"name": "circle", "color": "%d,%d,%d,255" % (r, g, b), "size": "3"})
+
+
+def _highlight_layer(source_layer, fids, label_field, name, overlay=False):
+    """対象の地物だけを複製した一時レイヤ (林地台帳は赤、重ねる図形は青で強調、ラベルつき)。"""
+    wkb = QgsWkbTypes.multiType(QgsWkbTypes.flatType(source_layer.wkbType()))
     layer = QgsVectorLayer("%s?field=label:string" % QgsWkbTypes.displayString(wkb), name, "memory")
-    layer.setCrs(parent_layer.crs())
+    layer.setCrs(source_layer.crs())
     feats, rect = [], QgsRectangle()
     rect.setNull()
     request = QgsFeatureRequest().setFilterFids(list(fids))
-    for f in parent_layer.getFeatures(request):
+    for f in source_layer.getFeatures(request):
         geom = f.geometry()
         if geom is None or geom.isNull():
             continue
@@ -112,15 +148,7 @@ def _highlight_layer(parent_layer, fids, label_field, name):
     layer.dataProvider().addFeatures(feats)
     layer.updateExtents()
 
-    gtype = layer.geometryType()
-    if gtype == QgsWkbTypes.PolygonGeometry:
-        symbol = QgsFillSymbol.createSimple({"color": "255,235,0,90", "outline_color": "220,0,0,255",
-                                             "outline_width": "0.8"})
-    elif gtype == QgsWkbTypes.LineGeometry:
-        symbol = QgsLineSymbol.createSimple({"color": "220,0,0,255", "width": "1.2"})
-    else:
-        symbol = QgsMarkerSymbol.createSimple({"name": "circle", "color": "220,0,0,255", "size": "3"})
-    layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+    layer.setRenderer(QgsSingleSymbolRenderer(_symbol(layer.geometryType(), overlay)))
 
     if label_field:
         fmt = QgsTextFormat()
@@ -194,6 +222,24 @@ def _label(layout, text, font, size, page, x, y, w, h, frame=False, valign=Qt.Al
     return label
 
 
+def _legend(layout, parent_name, overlay_name, font, page, x, y, w, h):
+    """地図の右下に置く凡例 (色の四角 + レイヤ名)。"""
+    label = QgsLayoutItemLabel(layout)
+    label.setMode(QgsLayoutItemLabel.ModeHtml)
+    item = '<span style="color:rgb(%d,%d,%d)">■</span> %s'
+    label.setText('<div style="font-family:\'%s\'; font-size:9pt;">%s&nbsp;&nbsp;%s</div>'
+                  % (escape(font, quote=True), item % (PARCEL_COLOR + (escape(parent_name),)),
+                     item % (OVERLAY_COLOR + (escape(overlay_name),))))
+    label.setBackgroundEnabled(True)
+    label.setFrameEnabled(True)
+    if hasattr(label, "setMarginX"):
+        label.setMarginX(1.5)
+        label.setMarginY(1.0)
+    layout.addLayoutItem(label)
+    _place(label, page, x, y, w, h)
+    return label
+
+
 def _place(item, page, x, y, w, h):
     mm = _mm()
     item.attemptResize(QgsLayoutSize(w, h, mm))
@@ -215,6 +261,10 @@ def build(project, parent_layer, specs, options, base_layers, fields, labels):
         pages.addPage(page)
 
     to_project = QgsCoordinateTransform(parent_layer.crs(), project.crs(), project)
+    ov = options.overlay
+    if ov is not None:
+        ov_index = qgis_data.key_index(ov.layer, ov.key_field, ov.keys([r for s in specs for r in s.results]))
+        ov_to_project = QgsCoordinateTransform(ov.layer.crs(), project.crs(), project)
     info_h = INFO_H if options.show_info else 0
     map_y = MARGIN + TITLE_H + 2
     map_h = H - map_y - MARGIN - (info_h + 2 if info_h else 0)
@@ -224,6 +274,21 @@ def build(project, parent_layer, specs, options, base_layers, fields, labels):
         hl, rect = _highlight_layer(parent_layer, spec.fids, options.label_field, "強調表示_%d" % (i + 1))
         project.addMapLayer(hl, False)       # 凡例には出さずプロジェクトに登録する
         temp_layers.append(hl)
+        if rect is not None:
+            rect = to_project.transformBoundingBox(rect)
+        shown = [hl]
+        if ov is not None:
+            ov_fids = {fid for k in ov.keys(spec.results) for fid in ov_index.get(k, [])}
+            ol, ov_rect = _highlight_layer(ov.layer, ov_fids, None, "重ねる図形_%d" % (i + 1), overlay=True)
+            project.addMapLayer(ol, False)
+            temp_layers.append(ol)
+            shown.append(ol)                 # 林地台帳の下に描く
+            if ov_rect is not None:          # 施業班も入るように範囲を広げる
+                ov_rect = ov_to_project.transformBoundingBox(ov_rect)
+                if rect is None:
+                    rect = ov_rect
+                else:
+                    rect.combineExtentWith(ov_rect)
 
         _label(layout, spec.title, options.font, 14, i, MARGIN, MARGIN, W - 2 * MARGIN - 55, TITLE_H)
 
@@ -232,11 +297,10 @@ def build(project, parent_layer, specs, options, base_layers, fields, labels):
         layout.addLayoutItem(map_item)
         _place(map_item, i, MARGIN, map_y, W - 2 * MARGIN, map_h)
         map_item.setCrs(project.crs())
-        map_item.setLayers([hl] + list(base_layers))
+        map_item.setLayers(shown + [l for l in base_layers if ov is None or l.id() != ov.layer.id()])
         map_item.setKeepLayerSet(True)
         map_item.setFrameEnabled(True)
         if rect is not None:
-            rect = to_project.transformBoundingBox(rect)
             rect.scale(EXTENT_MARGIN)
             if rect.width() == 0 or rect.height() == 0:
                 rect.grow(10)
@@ -259,6 +323,10 @@ def build(project, parent_layer, specs, options, base_layers, fields, labels):
         bar.applyDefaultSize(project.crs().mapUnits())
         layout.addLayoutItem(bar)
         bar.attemptMove(QgsLayoutPoint(MARGIN + 3, map_y + map_h - 14, mm), True, False, i)
+        if ov is not None:
+            legend_w = min(W - 2 * MARGIN - 60, 14 + 1.8 * len(parent_layer.name() + ov.layer.name()))
+            _legend(layout, parent_layer.name(), ov.layer.name(), options.font, i,
+                    W - MARGIN - 3 - legend_w, map_y + map_h - 11, legend_w, 8)
 
         if options.show_info:
             cols = info_columns(spec.results, fields, labels)

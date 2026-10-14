@@ -2,7 +2,7 @@ import os
 import traceback
 from collections import OrderedDict
 
-from qgis.core import QgsProject
+from qgis.core import QgsCoordinateTransform, QgsProject, QgsRectangle, QgsVectorLayer
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QFont, QFontDatabase
 from qgis.PyQt.QtWidgets import (
@@ -190,10 +190,21 @@ class MainDialog(QDialog):
         self.scale_spin.setPrefix("1 : ")
         self.info_check = QCheckBox("ページ下に林地台帳・森林簿などの情報を表示する")
         self.info_check.setChecked(True)
+        self.overlay_layer = QComboBox()        # 一緒に描く図形レイヤ (施業班など)
+        self.overlay_key = QComboBox()          # そのレイヤのキー項目 (KEY_02 など)
+        self.overlay_match = QComboBox()        # 検索結果側の項目 (林地台帳の施業KEY など)
+        self.overlay_layer.currentIndexChanged.connect(lambda *_: self.update_overlay_keys())
+        overlay_row = QHBoxLayout()
+        overlay_row.addWidget(self.overlay_layer, 2)
+        overlay_row.addWidget(QLabel("の"))
+        overlay_row.addWidget(self.overlay_key, 1)
+        overlay_row.addWidget(QLabel("＝"))
+        overlay_row.addWidget(self.overlay_match, 2)
         form.addRow(self.only_matched)
         form.addRow("地図の範囲", self.range_combo)
         form.addRow("用紙", self.orient_combo)
         form.addRow("縮尺", self.scale_spin)
+        form.addRow("重ねる図形 (青で表示)", overlay_row)
         form.addRow(self.info_check)
         form.addRow("フォント", self.font_combo)
         form.addRow("タイトル", self.title_edit)
@@ -295,6 +306,7 @@ class MainDialog(QDialog):
             row.update_fields()
         self.update_period_fields()
         self.update_owner_combo()
+        self.update_overlay_layers()
         self.results, self.hits = [], []
         self.show_hits()
 
@@ -478,9 +490,34 @@ class MainDialog(QDialog):
             QMessageBox.information(self, TITLE, "選択対象がありません。先に検索してください。")
             return
         self.parent_layer.selectByIds(fids)
+        selected = [self.parent_layer]
+        msg = "%s: %d 件" % (self.parent_layer.name(), len(fids))
+        ov = self.overlay()
+        if ov is not None:      # 重ねる図形 (施業班) も選択する
+            index = qgis_data.key_index(ov.layer, ov.key_field, ov.keys(results))
+            ov_fids = sorted({fid for v in index.values() for fid in v})
+            ov.layer.selectByIds(ov_fids)
+            selected.append(ov.layer)
+            msg += "、%s: %d 件" % (ov.layer.name(), len(ov_fids))
         if zoom:
-            self.iface.mapCanvas().zoomToSelected(self.parent_layer)
-        self.iface.messageBar().pushSuccess("地図で選択", "%s: %d 件を選択しました" % (self.parent_layer.name(), len(fids)))
+            self.zoom_to_selected(selected)
+        self.iface.messageBar().pushSuccess("地図で選択", msg + " を選択しました")
+
+    def zoom_to_selected(self, layers):
+        """複数レイヤの選択地物がすべて入る範囲に地図を合わせる。"""
+        canvas = self.iface.mapCanvas()
+        crs = canvas.mapSettings().destinationCrs()
+        rect = QgsRectangle()
+        rect.setNull()
+        for layer in layers:
+            if layer.selectedFeatureCount():
+                tr = QgsCoordinateTransform(layer.crs(), crs, QgsProject.instance())
+                rect.combineExtentWith(tr.transformBoundingBox(layer.boundingBoxOfSelected()))
+        if rect.isNull():
+            return
+        rect.scale(1.2)
+        canvas.setExtent(rect)
+        canvas.refresh()
 
     # ---------- 出力 ----------
     def update_owner_combo(self):
@@ -499,6 +536,53 @@ class MainDialog(QDialog):
                     self.owner_combo.setCurrentIndex(hit)
                     return
 
+    def update_overlay_layers(self):
+        """重ねる図形の候補 = 図形を持つベクタレイヤ (親レイヤ以外)。施業班を既定にする。"""
+        keep = self.overlay_layer.currentData()
+        self.overlay_layer.blockSignals(True)
+        self.overlay_layer.clear()
+        self.overlay_layer.addItem("(なし)", None)
+        for layer in QgsProject.instance().mapLayers().values():
+            if isinstance(layer, QgsVectorLayer) and layer.isSpatial() and layer is not self.parent_layer:
+                self.overlay_layer.addItem(layer.name(), layer.id())
+        i = self.overlay_layer.findData(keep) if keep else -1
+        if i < 0:
+            i = next((k for k in range(1, self.overlay_layer.count())
+                      if "施業班" in self.overlay_layer.itemText(k)), 0)
+        self.overlay_layer.setCurrentIndex(i)
+        self.overlay_layer.blockSignals(False)
+
+        self.overlay_match.clear()
+        for src, label in self.labels.items():
+            for n in self.names[src]:
+                self.overlay_match.addItem("%s: %s" % (label, n), (src, n))
+        hit = next((k for k in range(self.overlay_match.count())
+                    if "施業" in self.overlay_match.itemData(k)[1]
+                    and any(w in self.overlay_match.itemData(k)[1].upper() for w in ("KEY", "キー"))), 0)
+        self.overlay_match.setCurrentIndex(hit)     # 親(林地台帳)の施業KEY が先に見つかる
+        self.update_overlay_keys()
+
+    def update_overlay_keys(self):
+        layer = self.overlay_layer_obj()
+        self.overlay_key.clear()
+        for n in qgis_data.field_names(layer):
+            self.overlay_key.addItem(n, n)
+        for key in ("KEY_02", "施業KEY", "施業キー", "KEY"):
+            i = next((k for k in range(self.overlay_key.count()) if key in self.overlay_key.itemText(k).upper()), -1)
+            if i >= 0:
+                self.overlay_key.setCurrentIndex(i)
+                break
+
+    def overlay_layer_obj(self):
+        return QgsProject.instance().mapLayer(self.overlay_layer.currentData() or "")
+
+    def overlay(self):
+        """選択中の「重ねる図形」の設定 (無ければ None)。"""
+        layer, match = self.overlay_layer_obj(), self.overlay_match.currentData()
+        if layer is None or not self.overlay_key.currentData() or not match:
+            return None
+        return map_print.Overlay(layer, self.overlay_key.currentData(), match[0], match[1])
+
     def build_print(self, results, title=None):
         """検索結果を地図の印刷レイアウトにする。使い終わったら cleanup() を呼ぶこと。"""
         if self.parent_layer is None or not self.parent_layer.isSpatial():
@@ -509,7 +593,7 @@ class MainDialog(QDialog):
         options = map_print.Options(
             landscape=self.orient_combo.currentData(), scale=self.scale_spin.value(),
             show_info=self.info_check.isChecked(), font=self.font_combo.currentFont().family(),
-            label_field=label_field)
+            label_field=label_field, overlay=self.overlay())
         return map_print.build(QgsProject.instance(), self.parent_layer, specs, options,
                                self.iface.mapCanvas().layers(), self.checked_fields(), self.labels)
 
