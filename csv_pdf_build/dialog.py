@@ -4,21 +4,21 @@ from collections import OrderedDict
 
 from qgis.core import QgsProject
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QFont, QFontDatabase, QTextDocument
+from qgis.PyQt.QtGui import QFont, QFontDatabase
 from qgis.PyQt.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
+    QAbstractItemView, QApplication, QCheckBox, QSpinBox, QComboBox, QDialog, QFileDialog,
     QFontComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout,
 )
 
-from . import core, preview, qgis_data
+from . import core, map_print, preview, qgis_data
 
 ITEM_CHECKABLE = Qt.ItemFlag.ItemIsUserCheckable
 CHECKED = Qt.CheckState.Checked
 UNCHECKED = Qt.CheckState.Unchecked
 ALL_FIELDS = "(全項目)"
-PREVIEW_LIMIT = 10   # 印刷プレビューに表示する最大件数 (全件だと重く応答しなくなる)
+PREVIEW_LIMIT = 10   # 印刷プレビューに描く最大ページ数 (地図の描画は 1 ページごとに時間がかかる)
 TITLE = "林地台帳 CSV/PDF 出力"
 
 
@@ -168,19 +168,36 @@ class MainDialog(QDialog):
         root.addWidget(box)
 
         # --- 4. 出力 ---
-        box = QGroupBox("4. 出力 (表の行を選択した場合は選択行のみ、未選択なら検索結果すべて)")
+        box = QGroupBox("4. 地図PDF出力 (表の行を選択した場合は選択行のみ、未選択なら検索結果すべて)")
         form = QFormLayout(box)
         self.only_matched = QCheckBox("リレーション先を検索した場合は、一致したレコードのみ出力する")
         self.only_matched.setChecked(True)
         self.owner_combo = QComboBox()
         self.font_combo = QFontComboBox()
         self.font_combo.setCurrentFont(QFont(self.default_font()))
-        self.title_edit = QLineEdit("林地台帳 出力")
+        self.title_edit = QLineEdit("林地台帳")
         self.title_field = QComboBox()
+        self.range_combo = QComboBox()
+        self.range_combo.addItem("1筆(1件)ごとに1ページ", True)
+        self.range_combo.addItem("検索結果をまとめて1ページ", False)
+        self.orient_combo = QComboBox()
+        self.orient_combo.addItem("A4 横", True)
+        self.orient_combo.addItem("A4 縦", False)
+        self.scale_spin = QSpinBox()
+        self.scale_spin.setRange(0, 1000000)
+        self.scale_spin.setSingleStep(500)
+        self.scale_spin.setSpecialValueText("自動 (対象に合わせる)")
+        self.scale_spin.setPrefix("1 : ")
+        self.info_check = QCheckBox("ページ下に林地台帳・森林簿などの情報を表示する")
+        self.info_check.setChecked(True)
         form.addRow(self.only_matched)
-        form.addRow("PDF フォント", self.font_combo)
-        form.addRow("PDF タイトル", self.title_edit)
-        form.addRow("PDF 見出し・結果表に使う親レイヤの項目", self.title_field)
+        form.addRow("地図の範囲", self.range_combo)
+        form.addRow("用紙", self.orient_combo)
+        form.addRow("縮尺", self.scale_spin)
+        form.addRow(self.info_check)
+        form.addRow("フォント", self.font_combo)
+        form.addRow("タイトル", self.title_edit)
+        form.addRow("地図ラベル・結果表に使う親レイヤの項目", self.title_field)
         form.addRow("所有者別PDFの所有者項目", self.owner_combo)
         h = QHBoxLayout()
         b_prev = QPushButton("印刷プレビュー → PDF")
@@ -479,32 +496,53 @@ class MainDialog(QDialog):
                     self.owner_combo.setCurrentIndex(hit)
                     return
 
-    def build_document(self, res, title=None):
-        html = core.build_html(res, self.checked_fields(), self.labels,
-                               title if title is not None else self.title_edit.text(),
-                               self.font_combo.currentFont().family(), self.title_field.currentData())
-        doc = QTextDocument()
-        doc.setDefaultFont(self.font_combo.currentFont())
-        doc.setHtml(html)
-        return doc
+    def build_print(self, results, title=None):
+        """検索結果を地図の印刷レイアウトにする。使い終わったら cleanup() を呼ぶこと。"""
+        if self.parent_layer is None or not self.parent_layer.isSpatial():
+            raise RuntimeError("検索レイヤに図形がないため、地図を出力できません。")
+        label_field = self.title_field.currentData()
+        specs = map_print.make_specs(results, self.range_combo.currentData(),
+                                     title if title is not None else self.title_edit.text(), self.parent_label)
+        options = map_print.Options(
+            landscape=self.orient_combo.currentData(), scale=self.scale_spin.value(),
+            show_info=self.info_check.isChecked(), font=self.font_combo.currentFont().family(),
+            label_field=label_field)
+        return map_print.build(QgsProject.instance(), self.parent_layer, specs, options,
+                               self.iface.mapCanvas().layers(), self.checked_fields(), self.labels)
 
     def preview_pdf(self):
-        """印刷プレビューを開き、そこから PDF 保存する。
-
-        プレビューは重いので先頭 PREVIEW_LIMIT 件だけ表示し、保存時に全件を出力する。
-        """
+        """印刷プレビューを開き、そこから PDF 保存する (プレビューは先頭 PREVIEW_LIMIT ページのみ描く)。"""
         res = self.target_results()
         if not res:
             return
+        each = self.range_combo.currentData()
+        shown = res[:PREVIEW_LIMIT] if each else res
+        built = None
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            doc = self.build_document(res[:PREVIEW_LIMIT])
+            built = self.build_print(shown)
+        except Exception as e:
+            QMessageBox.critical(self, TITLE, "プレビューを作れませんでした:\n%s" % e)
+            return
         finally:
             QApplication.restoreOverrideCursor()
-        dlg = preview.PreviewDialog(doc, min(len(res), PREVIEW_LIMIT), len(res),
-                                    lambda: self.build_document(res), parent=self)
-        if dlg.exec() and dlg.saved_path:
-            self.iface.messageBar().pushSuccess("PDF 出力", "%d 件を保存しました: %s" % (len(res), dlg.saved_path))
+        note = "%d 件を出力します。" % len(res)
+        if each and len(shown) < len(res):
+            note += "プレビューは先頭 %d ページのみ表示します (PDF には全 %d ページが入ります)。" % (len(shown), len(res))
+
+        def save_all(path):
+            full = self.build_print(res)
+            try:
+                return full.export_pdf(path)
+            finally:
+                full.cleanup()
+
+        try:
+            dlg = preview.PreviewDialog(built.page_count(), built.render_page, note, save_all, parent=self)
+            if dlg.exec() and dlg.saved_path:
+                self.iface.messageBar().pushSuccess("PDF 出力", "%d 件を保存しました: %s" % (len(res), dlg.saved_path))
+        finally:
+            built.cleanup()
 
     def export_pdf(self):
         res = self.target_results()
@@ -514,10 +552,19 @@ class MainDialog(QDialog):
         if not path:
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        built = None
         try:
-            preview.write_pdf(self.build_document(res), path)
+            built = self.build_print(res)
+            err = built.export_pdf(path)
+        except Exception:
+            err = traceback.format_exc()
         finally:
             QApplication.restoreOverrideCursor()
+            if built:
+                built.cleanup()
+        if err:
+            QMessageBox.critical(self, TITLE, "PDF を保存できませんでした:\n" + err)
+            return
         self.iface.messageBar().pushSuccess("PDF 出力", "%d 件を保存しました: %s" % (len(res), path))
 
     def export_owner_pdfs(self):
@@ -545,8 +592,13 @@ class MainDialog(QDialog):
                 QApplication.processEvents()
                 path = os.path.join(folder, core.safe_filename(owner, used) + ".pdf")
                 try:
-                    doc = self.build_document(items, "%s %s 様" % (self.title_edit.text(), owner))
-                    preview.write_pdf(doc, path)
+                    built = self.build_print(items, "%s %s 様" % (self.title_edit.text(), owner))
+                    try:
+                        err = built.export_pdf(path)
+                    finally:
+                        built.cleanup()
+                    if err:
+                        raise RuntimeError(err)
                     saved += 1
                 except Exception as e:  # 1 人分の失敗で全体を止めない
                     errors.append("%s: %s" % (owner, e))

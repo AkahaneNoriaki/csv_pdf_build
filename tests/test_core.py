@@ -43,8 +43,12 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(len(core.search_records(sample(), core.SRC_ALL, [cond(None, "contains", "なし")])), 0)
 
     def test_group_hits(self):
-        hits = core.search_records(sample(), D, [cond("地目", "equals", "山林")])
+        data = sample()
+        for i, r in enumerate(data):
+            r.fid = i + 1
+        hits = core.search_records(data, D, [cond("地目", "equals", "山林")])
         out = core.group_hits(hits)
+        self.assertEqual([r.fid for r in out], [1, 2])      # 絞り込んでも地物 ID は残る
         self.assertEqual([len(r.children[D]) for r in out], [1, 1])
         self.assertEqual(out[1].children[D][0]["氏名"], "佐藤 次郎")
         self.assertEqual(len(core.group_hits(hits, only_matched=False)[1].children[D]), 2)

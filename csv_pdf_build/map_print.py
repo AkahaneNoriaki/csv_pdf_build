@@ -1,0 +1,272 @@
+"""検索結果の林地台帳を、QGIS の印刷レイアウトで地図として出力する。
+
+1 ページ = 地図 1 枚。対象の地物を赤で強調した一時レイヤを地図の最上位に重ね、地物の範囲に
+ズームする。下部に、林地台帳と紐づくリレーション先(森林簿など)の情報欄を置ける。
+"""
+from qgis.core import (
+    QgsCoordinateTransform, QgsFeature, QgsFeatureRequest, QgsFillSymbol, QgsLayoutExporter,
+    QgsLayoutItemLabel, QgsLayoutItemMap, QgsLayoutItemPage, QgsLayoutItemScaleBar, QgsLayoutPoint,
+    QgsLayoutSize, QgsLineSymbol, QgsMarkerSymbol, QgsPalLayerSettings, QgsPrintLayout, QgsProject,
+    QgsRectangle, QgsSingleSymbolRenderer, QgsTextBufferSettings, QgsTextFormat, QgsUnitTypes,
+    QgsVectorLayer, QgsVectorLayerSimpleLabeling, QgsWkbTypes,
+)
+from qgis.PyQt.QtCore import QSize, Qt
+from qgis.PyQt.QtGui import QColor, QFont
+
+from . import core, qgis_data
+
+MARGIN = 10          # 用紙の余白 (mm)
+TITLE_H = 9          # タイトル行の高さ
+INFO_H = 42          # 情報欄の高さ
+EXTENT_MARGIN = 2.0  # 対象範囲の周囲に取る余白の倍率 (周りの筆も見えるようにする)
+
+
+def _mm():
+    unit = getattr(QgsUnitTypes, "LayoutMillimeters", None)
+    if unit is None:
+        from qgis.core import Qgis
+        unit = Qgis.LayoutUnit.Millimeters
+    return unit
+
+
+class Options:
+    def __init__(self, landscape=True, scale=0, show_info=True, font="sans-serif", label_field=None):
+        self.landscape = landscape
+        self.scale = scale              # 0 = 対象に合わせて自動
+        self.show_info = show_info
+        self.font = font
+        self.label_field = label_field  # 地図上のラベルに使う親レイヤの項目
+
+
+class PageSpec:
+    """1 ページ分: 表示する親の地物 ID と、情報欄に載せる Result。"""
+
+    def __init__(self, title, results):
+        self.title = title
+        self.results = results
+        self.fids = [r.fid for r in results if r.fid is not None]
+
+
+def make_specs(results, each, title, title_of):
+    """each=True: 1 件 1 ページ。False: 全件をまとめて 1 ページ。"""
+    if not each:
+        return [PageSpec(title, list(results))] if results else []
+    return [PageSpec("%s %s" % (title, title_of(r)), [r]) for r in results]
+
+
+class Built:
+    """組み立て済みのレイアウトと、後始末が必要な一時レイヤ。"""
+
+    def __init__(self, layout, project, temp_layers, page_size):
+        self.layout = layout
+        self.project = project
+        self.temp_layers = temp_layers
+        self.page_size = page_size      # (幅mm, 高さmm)
+
+    def page_count(self):
+        return self.layout.pageCollection().pageCount()
+
+    def render_page(self, index, width_px):
+        w, h = self.page_size
+        exporter = QgsLayoutExporter(self.layout)
+        return exporter.renderPageToImage(index, QSize(int(width_px), int(width_px * h / w)))
+
+    def export_pdf(self, path):
+        """PDF に書き出す。失敗したときは理由の文字列、成功なら None を返す。"""
+        exporter = QgsLayoutExporter(self.layout)
+        settings = QgsLayoutExporter.PdfExportSettings()
+        settings.dpi = 200
+        result = exporter.exportToPdf(path, settings)
+        if result == QgsLayoutExporter.Success:
+            return None
+        return {QgsLayoutExporter.FileError: "ファイルに書き込めません (他で開いていないか確認してください)",
+                QgsLayoutExporter.MemoryError: "メモリ不足です (用紙数を減らしてください)",
+                QgsLayoutExporter.PrintError: "出力に失敗しました",
+                QgsLayoutExporter.SvgLayerError: "出力に失敗しました"}.get(result, "出力に失敗しました (コード %s)" % result)
+
+    def cleanup(self):
+        for layer in self.temp_layers:
+            self.project.removeMapLayer(layer.id())
+        self.temp_layers = []
+
+
+# ---------- 強調表示レイヤ ----------
+def _highlight_layer(parent_layer, fids, label_field, name):
+    """対象の地物だけを複製した一時レイヤ (赤で強調、ラベルつき)。"""
+    wkb = QgsWkbTypes.multiType(QgsWkbTypes.flatType(parent_layer.wkbType()))
+    layer = QgsVectorLayer("%s?field=label:string" % QgsWkbTypes.displayString(wkb), name, "memory")
+    layer.setCrs(parent_layer.crs())
+    feats, rect = [], QgsRectangle()
+    rect.setNull()
+    request = QgsFeatureRequest().setFilterFids(list(fids))
+    for f in parent_layer.getFeatures(request):
+        geom = f.geometry()
+        if geom is None or geom.isNull():
+            continue
+        geom.convertToMultiType()
+        nf = QgsFeature(layer.fields())
+        nf.setGeometry(geom)
+        nf.setAttribute("label", qgis_data.to_text(f[label_field]) if label_field else "")
+        feats.append(nf)
+        rect.combineExtentWith(geom.boundingBox())
+    layer.dataProvider().addFeatures(feats)
+    layer.updateExtents()
+
+    gtype = layer.geometryType()
+    if gtype == QgsWkbTypes.PolygonGeometry:
+        symbol = QgsFillSymbol.createSimple({"color": "255,235,0,90", "outline_color": "220,0,0,255",
+                                             "outline_width": "0.8"})
+    elif gtype == QgsWkbTypes.LineGeometry:
+        symbol = QgsLineSymbol.createSimple({"color": "220,0,0,255", "width": "1.2"})
+    else:
+        symbol = QgsMarkerSymbol.createSimple({"name": "circle", "color": "220,0,0,255", "size": "3"})
+    layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+
+    if label_field:
+        fmt = QgsTextFormat()
+        fmt.setSize(9)
+        fmt.setColor(QColor(120, 0, 0))
+        buf = QgsTextBufferSettings()
+        buf.setEnabled(True)
+        buf.setColor(QColor(255, 255, 255))
+        buf.setSize(1)
+        fmt.setBuffer(buf)
+        settings = QgsPalLayerSettings()
+        settings.fieldName = "label"
+        settings.setFormat(fmt)
+        layer.setLabeling(QgsVectorLayerSimpleLabeling(settings))
+        layer.setLabelsEnabled(True)
+    return layer, (None if rect.isNull() or feats == [] else rect)
+
+
+# ---------- 情報欄の文章 ----------
+def _short(rec, fields):
+    return " / ".join(rec.get(f, "") for f in fields if rec.get(f, ""))
+
+
+def info_columns(results, fields, labels):
+    """情報欄の列 [(見出し, 本文), ...]。1 件なら親 + 各リレーション先、複数件なら一覧。"""
+    if len(results) != 1:
+        pf = fields.get(core.SRC_PARENT, [])[:4]
+        lines = [_short(r.parent, pf) for r in results[:25]]
+        if len(results) > 25:
+            lines.append("…他 %d 件" % (len(results) - 25))
+        return [("%s (%d 件)" % (labels[core.SRC_PARENT], len(results)), "\n".join(lines))]
+    res = results[0]
+    cols = []
+    for src, label in labels.items():
+        fs = fields.get(src, [])
+        if not fs:
+            continue
+        if src == core.SRC_PARENT:
+            body = "\n".join("%s: %s" % (f, res.parent.get(f, "")) for f in fs)
+        else:
+            recs = res.records(src)
+            body = "\n".join(_short(r, fs) for r in recs[:12]) or "(該当なし)"
+            if len(recs) > 12:
+                body += "\n…他 %d 件" % (len(recs) - 12)
+        cols.append((label, body))
+    return cols
+
+
+# ---------- レイアウト ----------
+def _text_format(font, size):
+    fmt = QgsTextFormat()
+    fmt.setFont(QFont(font))
+    fmt.setSize(size)
+    return fmt
+
+
+def _label(layout, text, font, size, page, x, y, w, h, frame=False, valign=Qt.AlignmentFlag.AlignVCenter):
+    label = QgsLayoutItemLabel(layout)
+    label.setText(text)
+    if hasattr(label, "setTextFormat"):
+        label.setTextFormat(_text_format(font, size))
+    else:
+        label.setFont(QFont(font, int(size)))
+    label.setVAlign(valign)
+    if hasattr(label, "setMarginX"):
+        label.setMarginX(1.5)
+        label.setMarginY(1.2)
+    label.setFrameEnabled(frame)
+    layout.addLayoutItem(label)
+    _place(label, page, x, y, w, h)
+    return label
+
+
+def _place(item, page, x, y, w, h):
+    mm = _mm()
+    item.attemptResize(QgsLayoutSize(w, h, mm))
+    item.attemptMove(QgsLayoutPoint(x, y, mm), True, False, page)
+
+
+def build(project, parent_layer, specs, options, base_layers, fields, labels):
+    """specs の各ページに地図・タイトル・縮尺・情報欄を置いたレイアウトを作る。"""
+    mm = _mm()
+    W, H = (297, 210) if options.landscape else (210, 297)
+    layout = QgsPrintLayout(project)
+    layout.initializeDefaults()
+    layout.setName("林地台帳出力")
+    pages = layout.pageCollection()
+    pages.page(0).setPageSize(QgsLayoutSize(W, H, mm))
+    for _ in range(1, len(specs)):
+        page = QgsLayoutItemPage(layout)
+        page.setPageSize(QgsLayoutSize(W, H, mm))
+        pages.addPage(page)
+
+    to_project = QgsCoordinateTransform(parent_layer.crs(), project.crs(), project)
+    info_h = INFO_H if options.show_info else 0
+    map_y = MARGIN + TITLE_H + 2
+    map_h = H - map_y - MARGIN - (info_h + 2 if info_h else 0)
+    temp_layers = []
+
+    for i, spec in enumerate(specs):
+        hl, rect = _highlight_layer(parent_layer, spec.fids, options.label_field, "強調表示_%d" % (i + 1))
+        project.addMapLayer(hl, False)       # 凡例には出さずプロジェクトに登録する
+        temp_layers.append(hl)
+
+        _label(layout, spec.title, options.font, 14, i, MARGIN, MARGIN, W - 2 * MARGIN - 55, TITLE_H)
+
+        map_item = QgsLayoutItemMap(layout)
+        map_item.setId("map_%d" % i)
+        layout.addLayoutItem(map_item)
+        _place(map_item, i, MARGIN, map_y, W - 2 * MARGIN, map_h)
+        map_item.setCrs(project.crs())
+        map_item.setLayers([hl] + list(base_layers))
+        map_item.setKeepLayerSet(True)
+        map_item.setFrameEnabled(True)
+        if rect is not None:
+            rect = to_project.transformBoundingBox(rect)
+            rect.scale(EXTENT_MARGIN)
+            if rect.width() == 0 or rect.height() == 0:
+                rect.grow(10)
+            map_item.zoomToExtent(rect)
+            if options.scale > 0:
+                map_item.setScale(options.scale)
+
+        scale = map_item.scale()
+        scale_text = "縮尺 1:{:,}".format(int(round(scale))) if scale == scale and scale > 0 else "縮尺 -"
+        _label(layout, scale_text,
+               options.font, 10, i, W - MARGIN - 52, MARGIN, 52, TITLE_H)
+
+        bar = QgsLayoutItemScaleBar(layout)
+        bar.setLinkedMap(map_item)
+        bar.setUnits(project.crs().mapUnits())
+        bar.setNumberOfSegments(2)
+        bar.setNumberOfSegmentsLeft(0)
+        bar.setStyle("Single Box")
+        bar.setBackgroundEnabled(True)
+        bar.applyDefaultSize(project.crs().mapUnits())
+        layout.addLayoutItem(bar)
+        bar.attemptMove(QgsLayoutPoint(MARGIN + 3, map_y + map_h - 14, mm), True, False, i)
+
+        if options.show_info:
+            cols = info_columns(spec.results, fields, labels)
+            if cols:
+                gap = 2
+                col_w = (W - 2 * MARGIN - gap * (len(cols) - 1)) / len(cols)
+                y = H - MARGIN - info_h
+                for k, (head, body) in enumerate(cols):
+                    _label(layout, "【%s】\n%s" % (head, body), options.font, 9, i,
+                           MARGIN + k * (col_w + gap), y, col_w, info_h, frame=True, valign=Qt.AlignmentFlag.AlignTop)
+    return Built(layout, project, temp_layers, (W, H))

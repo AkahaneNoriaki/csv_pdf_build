@@ -215,7 +215,9 @@ def group_hits(hits, only_matched=True):
             continue
         children = dict(res.children)
         children[source] = [res.records(source)[i] for i in idxs]
-        out.append(Result(res.parent, children))
+        narrowed = Result(res.parent, children)
+        narrowed.fid = res.fid      # 地図に表示する地物 ID を引き継ぐ
+        out.append(narrowed)
     return out
 
 
