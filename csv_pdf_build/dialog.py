@@ -2,8 +2,7 @@ from collections import OrderedDict
 
 from qgis.core import QgsProject
 from qgis.PyQt.QtCore import Qt, QTimer
-from qgis.PyQt.QtGui import QFont, QFontDatabase, QPageLayout, QPageSize, QTextDocument
-from qgis.PyQt.QtPrintSupport import QPrinter
+from qgis.PyQt.QtGui import QFont, QFontDatabase, QTextDocument
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
     QFontComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -11,7 +10,7 @@ from qgis.PyQt.QtWidgets import (
     QTableWidgetItem, QTabWidget, QVBoxLayout,
 )
 
-from . import core, qgis_data
+from . import core, preview, qgis_data
 
 ITEM_CHECKABLE = Qt.ItemFlag.ItemIsUserCheckable
 CHECKED = Qt.CheckState.Checked
@@ -170,11 +169,14 @@ class MainDialog(QDialog):
         form.addRow("PDF 見出し・結果表に使う親レイヤの項目", self.title_field)
         h = QHBoxLayout()
         b_csv = QPushButton("CSV 出力")
+        b_prev = QPushButton("印刷プレビュー → PDF")
         b_pdf = QPushButton("PDF 出力")
         b_csv.clicked.connect(self.export_csv)
+        b_prev.clicked.connect(self.preview_pdf)
         b_pdf.clicked.connect(self.export_pdf)
         h.addStretch(1)
         h.addWidget(b_csv)
+        h.addWidget(b_prev)
         h.addWidget(b_pdf)
         form.addRow(h)
         root.addWidget(box)
@@ -422,6 +424,23 @@ class MainDialog(QDialog):
             return
         self.iface.messageBar().pushSuccess("CSV 出力", "%d 行を保存しました: %s" % (len(rows), path))
 
+    def build_document(self, res):
+        html = core.build_html(res, self.checked_fields(), self.labels, self.title_edit.text(),
+                               self.font_combo.currentFont().family(), self.title_field.currentData())
+        doc = QTextDocument()
+        doc.setDefaultFont(self.font_combo.currentFont())
+        doc.setHtml(html)
+        return doc
+
+    def preview_pdf(self):
+        """検索結果(親レイヤ+リレーション先)の印刷プレビューを開き、そこから PDF 保存する。"""
+        res = self.target_results()
+        if not res:
+            return
+        dlg = preview.PreviewDialog(self.build_document(res), len(res), parent=self)
+        if dlg.exec() and dlg.saved_path:
+            self.iface.messageBar().pushSuccess("PDF 出力", "%d 件を保存しました: %s" % (len(res), dlg.saved_path))
+
     def export_pdf(self):
         res = self.target_results()
         if not res:
@@ -429,15 +448,5 @@ class MainDialog(QDialog):
         path, _ = QFileDialog.getSaveFileName(self, "PDF 保存", "林地台帳.pdf", "PDF (*.pdf)")
         if not path:
             return
-        html = core.build_html(res, self.checked_fields(), self.labels, self.title_edit.text(),
-                               self.font_combo.currentFont().family(), self.title_field.currentData())
-        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
-        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
-        printer.setOutputFileName(path)
-        printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-        printer.setPageOrientation(QPageLayout.Orientation.Portrait)
-        doc = QTextDocument()
-        doc.setDefaultFont(self.font_combo.currentFont())
-        doc.setHtml(html)
-        doc.print_(printer) if hasattr(doc, "print_") else doc.print(printer)
+        preview.print_doc(self.build_document(res), preview.make_printer(path))
         self.iface.messageBar().pushSuccess("PDF 出力", "%d 件を保存しました: %s" % (len(res), path))
