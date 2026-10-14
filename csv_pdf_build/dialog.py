@@ -2,7 +2,7 @@ import os
 import traceback
 from collections import OrderedDict
 
-from qgis.core import QgsCoordinateTransform, QgsProject, QgsRectangle, QgsVectorLayer
+from qgis.core import QgsCoordinateTransform, QgsProject, QgsRectangle, QgsSettings, QgsVectorLayer
 from qgis.gui import QgsCollapsibleGroupBox
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QFont, QFontDatabase
@@ -21,6 +21,7 @@ UNCHECKED = Qt.CheckState.Unchecked
 ALL_FIELDS = "(全項目)"
 PREVIEW_LIMIT = 10   # 印刷プレビューに描く最大ページ数 (地図の描画は 1 ページごとに時間がかかる)
 TITLE = "林地台帳 CSV/PDF 出力"
+OUT_DIR_KEY = "csv_pdf_build/out_dir"   # 保存先フォルダ (QGIS を再起動しても覚えておく)
 
 
 class ConditionRow(QHBoxLayout):
@@ -170,6 +171,16 @@ class MainDialog(QDialog):
         self.only_matched = QCheckBox("リレーション先を検索した場合は、一致したレコードのみ出力する")
         self.only_matched.setChecked(True)
         out.addWidget(self.only_matched)
+        h = QHBoxLayout()
+        self.out_dir_edit = QLineEdit(QgsSettings().value(OUT_DIR_KEY, "", type=str))
+        self.out_dir_edit.setPlaceholderText("保存先フォルダ (未設定なら保存のたびに選びます)")
+        self.out_dir_edit.editingFinished.connect(lambda: self.set_out_dir(self.out_dir_edit.text()))
+        b_dir = QPushButton("参照…")
+        b_dir.clicked.connect(self.choose_out_dir)
+        h.addWidget(QLabel("保存先"))
+        h.addWidget(self.out_dir_edit, 1)
+        h.addWidget(b_dir)
+        out.addLayout(h)
         self.out_tabs = QTabWidget()
         out.addWidget(self.out_tabs)
 
@@ -714,6 +725,36 @@ class MainDialog(QDialog):
         return map_print.build(QgsProject.instance(), self.parent_layer, specs, options,
                                self.iface.mapCanvas().layers(), self.checked_fields(), self.labels)
 
+    # ---------- 保存先 ----------
+    def out_dir(self):
+        d = self.out_dir_edit.text().strip()
+        return d if d and os.path.isdir(d) else ""
+
+    def set_out_dir(self, folder):
+        folder = (folder or "").strip()
+        self.out_dir_edit.setText(folder)
+        QgsSettings().setValue(OUT_DIR_KEY, folder)
+
+    def choose_out_dir(self):
+        folder = QFileDialog.getExistingDirectory(self, "保存先フォルダ", self.out_dir())
+        if folder:
+            self.set_out_dir(folder)
+
+    def default_path(self, name, ext):
+        """保存ダイアログの初期値 (保存先フォルダ + タイトルから作ったファイル名)。"""
+        return os.path.join(self.out_dir(), core.safe_filename(name) + ext)
+
+    def ask_save_path(self, caption, name, ext, filt):
+        """保存先フォルダで保存ダイアログを開く。選んだ場所を次回の保存先にする。"""
+        path, _ = QFileDialog.getSaveFileName(self, caption, self.default_path(name, ext), filt)
+        if path:
+            self.set_out_dir(os.path.dirname(path))
+        return path
+
+    def output_name(self, results):
+        """出力ファイル名の元 (まとめて 1 ページなら届出番号入りのタイトル)。"""
+        return self.title_edit.text() if self.range_combo.currentData() else self.summary_title(results)
+
     def preview_pdf(self):
         """印刷プレビューを開き、そこから PDF 保存する (プレビューは先頭 PREVIEW_LIMIT ページのみ描く)。"""
         res = self.target_results()
@@ -742,8 +783,10 @@ class MainDialog(QDialog):
                 full.cleanup()
 
         try:
-            dlg = preview.PreviewDialog(built.page_count(), built.render_page, note, save_all, parent=self)
+            dlg = preview.PreviewDialog(built.page_count(), built.render_page, note, save_all,
+                                        self.default_path(self.output_name(res), ".pdf"), parent=self)
             if dlg.exec() and dlg.saved_path:
+                self.set_out_dir(os.path.dirname(dlg.saved_path))
                 self.iface.messageBar().pushSuccess("PDF 出力", "%d 件を保存しました: %s" % (len(res), dlg.saved_path))
         finally:
             built.cleanup()
@@ -757,7 +800,7 @@ class MainDialog(QDialog):
         if not any(fields.get(s) for s in self.labels):
             QMessageBox.information(self, TITLE, "CSV タブで出力する項目をチェックしてください。")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "CSV 保存", "林地台帳.csv", "CSV (*.csv)")
+        path = self.ask_save_path("CSV 保存", self.output_name(res), ".csv", "CSV (*.csv)")
         if not path:
             return
         heads = self.info_heads()
@@ -774,7 +817,7 @@ class MainDialog(QDialog):
         res = self.target_results()
         if not res:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "PDF 保存", "林地台帳.pdf", "PDF (*.pdf)")
+        path = self.ask_save_path("PDF 保存", self.output_name(res), ".pdf", "PDF (*.pdf)")
         if not path:
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -836,9 +879,12 @@ class MainDialog(QDialog):
         if not groups:
             QMessageBox.information(self, TITLE, "届出番号の付いた検索結果がありません。Excel の「届出番号」列を確認してください。")
             return
-        folder = QFileDialog.getExistingDirectory(self, "所有者別PDFの保存先フォルダ")
+        folder = self.out_dir()          # 保存先が決まっていれば、そこにそのまま作る
         if not folder:
-            return
+            folder = QFileDialog.getExistingDirectory(self, "所有者別PDFの保存先フォルダ")
+            if not folder:
+                return
+            self.set_out_dir(folder)
         months = {}                      # 所有者 -> 月のフォルダ名 (月ごとに分けるとき)
         if self.month_check.isChecked():
             src, field = self.month_field()
