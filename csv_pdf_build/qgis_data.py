@@ -81,7 +81,28 @@ class _Scan:
             self.progress(self.label, self.n)
 
 
-def search(parent_layer, relations, source, conditions, selected_only=False, progress=None):
+def new_date_diag():
+    return {"parsed": 0, "failed": 0, "samples": []}
+
+
+def _date_diag(rec, active, diag):
+    """日付条件の対象項目が日付として読めたか数える (読めない値の例も控える)。"""
+    for c in active:
+        if c.op not in core.DATE_OPS:
+            continue
+        values = list(rec.values()) if c.field is None else [rec.get(c.field, "")]
+        for v in values:
+            if not v:
+                continue
+            if core.parse_date(v):
+                diag["parsed"] += 1
+            else:
+                diag["failed"] += 1
+                if v not in diag["samples"] and len(diag["samples"]) < 5:
+                    diag["samples"].append(v)
+
+
+def search(parent_layer, relations, source, conditions, selected_only=False, progress=None, diag=None):
     """リレーションレイヤを事前に読み込まず、検索のたびに必要な分だけ読んで Result を返す。
 
     1. 親レイヤを 1 回走査し、リレーションのキー -> 親の地物 ID の索引を作る
@@ -90,7 +111,8 @@ def search(parent_layer, relations, source, conditions, selected_only=False, pro
     3. 一致した親だけを取り出し、紐づく全リレーション先のレコードを集める
        (一致したキーのレコードだけを保持する)
     戻り値は Result (fid つき) のリスト。条件との突き合わせ(Hit 化)は呼び出し側が
-    core.search_records で行う。
+    core.search_records で行う。diag (new_date_diag()) を渡すと、日付条件の項目が
+    日付として読めた件数と、読めなかった値の例が入る。
     """
     active = [c for c in conditions if c.text]
     scan = _Scan(progress)
@@ -123,6 +145,8 @@ def search(parent_layer, relations, source, conditions, selected_only=False, pro
                 index[rid][key].append(fid)
         if need_parent_match:
             rec = feature_record(f, pnames)
+            if diag is not None:
+                _date_diag(rec, active, diag)
             if source == core.SRC_PARENT:
                 if all(core.record_matches(rec, c.field, c.op, c.text) for c in active):
                     parent_ok.add(fid)
@@ -147,6 +171,8 @@ def search(parent_layer, relations, source, conditions, selected_only=False, pro
                 if not owners:                    # 親に紐づかないレコードは対象外
                     continue
                 rec = feature_record(c, names)
+                if diag is not None:
+                    _date_diag(rec, active, diag)
                 if source == core.SRC_ALL:
                     for i, cond in enumerate(active):
                         if core.record_matches(rec, cond.field, cond.op, cond.text):

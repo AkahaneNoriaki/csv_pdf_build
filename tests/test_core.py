@@ -71,6 +71,11 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(p("2024/5/1"), dt.date(2024, 5, 1))
         self.assertEqual(p("2024-05-01T10:00:00"), dt.date(2024, 5, 1))
         self.assertEqual(p("令和6年5月"), dt.date(2024, 5, 1))
+        for text in ("令和六年四月一日", "令6.4.1", "R06.04.01", "令和060401", "20240401",
+                     "令和 6 年 4 月 1 日（月）", "㋿6年4月1日", "令和6年04月01日"):
+            self.assertEqual(p(text), dt.date(2024, 4, 1), text)
+        self.assertEqual(p("平成十二年二月三日"), dt.date(2000, 2, 3))
+        self.assertEqual(p("令和二十年1月1日"), dt.date(2038, 1, 1))
         self.assertIsNone(p("山林"))
         self.assertIsNone(p("令和6年13月1日"))
 
@@ -86,6 +91,11 @@ class CoreTest(unittest.TestCase):
         self.assertEqual([h.record["氏名"] for h in eq], ["C"])
         self.assertIsNotNone(core.condition_error([cond("更新日", "date_from", "あ")]))
         self.assertIsNone(core.condition_error(rng))
+
+    def test_missing_field_does_not_match(self):
+        rec = O(氏名="佐藤")
+        self.assertFalse(core.record_matches(rec, "更新日", "not_contains", "x"))
+        self.assertFalse(core.record_matches(rec, "更新日", "date_from", "2020-01-01"))
 
     def test_group_by_owner_parent_and_relation(self):
         g = core.group_by_owner(sample(), core.SRC_PARENT, "所有者")

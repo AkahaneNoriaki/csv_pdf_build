@@ -29,28 +29,54 @@ DATE_OPS = ("date_from", "date_to", "date_equals")
 
 # 和暦の元年の西暦 - 1 (令和6年 -> 2018 + 6)
 ERAS = {"令和": 2018, "平成": 1988, "昭和": 1925, "大正": 1911, "明治": 1867,
+        "令": 2018, "平": 1988, "昭": 1925, "大": 1911, "明": 1867,
         "R": 2018, "H": 1988, "S": 1925, "T": 1911, "M": 1867}
-_ERA_RE = re.compile(r"(令和|平成|昭和|大正|明治|[RHSTM])\s*\.?\s*(元|\d+)\s*(?:年|[./-])\s*(\d{1,2})"
-                     r"\s*(?:月|[./-])?\s*(?:(\d{1,2})\s*日?)?")
-_WEST_RE = re.compile(r"(\d{4})\s*(?:年|[./-])\s*(\d{1,2})\s*(?:月|[./-])?\s*(?:(\d{1,2})\s*日?)?")
+_ERA = r"(令和|平成|昭和|大正|明治|令|平|昭|大|明|[RHSTM])"
+_SEP = r"[./\-・,]"
+_ERA_RE = re.compile(_ERA + r"\s*\.?\s*(元|\d+)\s*(?:年|" + _SEP + r")\s*(\d{1,2})"
+                     r"\s*(?:月|" + _SEP + r")?\s*(?:(\d{1,2})\s*日?)?")
+_ERA_COMPACT_RE = re.compile(_ERA + r"\s*\.?\s*(\d{2})(\d{2})(\d{2})(?!\d)")
+_WEST_RE = re.compile(r"(\d{4})\s*(?:年|" + _SEP + r")\s*(\d{1,2})\s*(?:月|" + _SEP + r")?\s*(?:(\d{1,2})\s*日?)?")
+_WEST_COMPACT_RE = re.compile(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)")
+_KANJI_RE = re.compile(r"[〇一二三四五六七八九十]+")
+_KANJI_DIGITS = {c: str(i) for i, c in enumerate("〇一二三四五六七八九")}
+
+
+def _kanji_to_arabic(m):
+    """二〇二四 -> 2024, 十二 -> 12, 二十 -> 20"""
+    s = m.group(0)
+    if "十" in s:
+        left, _, right = s.partition("十")
+        tens = int("".join(_KANJI_DIGITS[c] for c in left)) if left else 1
+        ones = int("".join(_KANJI_DIGITS[c] for c in right)) if right else 0
+        return str(tens * 10 + ones)
+    return "".join(_KANJI_DIGITS[c] for c in s)
 
 
 @lru_cache(maxsize=65536)
 def parse_date(text):
-    """和暦(令和6年5月1日, R6.5.1)・西暦(2024/5/1, 2024年5月1日)を date にする。
+    """和暦・西暦の日付文字列を date にする。読み取れなければ None。
 
-    日が無い場合は 1 日として扱う。読み取れなければ None。
+    対応例: 令和6年5月1日 / 令和元年5月1日 / 令6.4.1 / R06.04.01 / 令和060401 /
+    令和六年四月一日 / 2024/5/1 / 2024年5月1日 / 20240501 / 2024-05-01T10:00:00
+    日が無い場合は 1 日として扱う。
     """
     t = unicodedata.normalize("NFKC", str(text)).upper().strip()
+    t = _KANJI_RE.sub(_kanji_to_arabic, t)
     m = _ERA_RE.search(t)
     if m:
         era, y, mo, d = m.group(1), m.group(2), m.group(3), m.group(4)
         year = ERAS[era] + (1 if y == "元" else int(y))
     else:
-        m = _WEST_RE.search(t)
-        if not m:
-            return None
-        year, mo, d = int(m.group(1)), m.group(2), m.group(3)
+        m = _ERA_COMPACT_RE.search(t)
+        if m:
+            era, y, mo, d = m.groups()
+            year = ERAS[era] + int(y)
+        else:
+            m = _WEST_RE.search(t) or _WEST_COMPACT_RE.search(t)
+            if not m:
+                return None
+            year, mo, d = int(m.group(1)), m.group(2), m.group(3)
     try:
         return datetime.date(year, int(mo), int(d) if d else 1)
     except ValueError:
@@ -125,7 +151,9 @@ def date_matches(value, op, text):
 
 
 def record_matches(record, field, op, text):
-    values = list(record.values()) if field is None else [record.get(field, "")]
+    if field is not None and field not in record:
+        return False    # その項目を持たないレイヤのレコードは対象外 (横断検索用)
+    values = list(record.values()) if field is None else [record[field]]
     if op in DATE_OPS:
         return any(date_matches(v, op, text) for v in values)
     if op == "not_contains":

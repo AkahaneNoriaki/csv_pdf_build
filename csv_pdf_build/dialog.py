@@ -233,7 +233,11 @@ class MainDialog(QDialog):
         for r in self.relations:
             self.labels[r.id()] = qgis_data.relation_label(r)
             self.names[r.id()] = qgis_data.field_names(r.referencingLayer())
-        self.names[core.SRC_ALL] = []
+        union = OrderedDict()
+        for src in self.labels:
+            for n in self.names[src]:
+                union[n] = True
+        self.names[core.SRC_ALL] = list(union)   # 横断検索: どのレイヤの項目名でも指定できる
         self.related_label.setText("、".join(self.labels[r.id()] for r in self.relations) or "(なし)")
 
         # 検索するレイヤの選択肢
@@ -286,7 +290,7 @@ class MainDialog(QDialog):
         self.period_field.addItem(ALL_FIELDS, None)
         for n in self.names.get(self.search_source(), []):
             self.period_field.addItem(n, n)
-        for key in ("入力年月日", "年月日", "更新日", "日"):
+        for key in ("届け出年月日", "届出年月日", "入力年月日", "年月日", "更新日", "日"):
             hit = next((i for i in range(self.period_field.count())
                         if key in (self.period_field.itemData(i) or "")), -1)
             if hit >= 0:
@@ -362,9 +366,10 @@ class MainDialog(QDialog):
             QApplication.processEvents()
 
         try:
+            diag = qgis_data.new_date_diag()
             self.results = qgis_data.search(
                 self.parent_layer, self.relations, self.search_source(), conds,
-                self.selected_only.currentData(), progress)
+                self.selected_only.currentData(), progress, diag)
             self.hits = core.search_records(self.results, self.search_source(), conds)
         except Exception:  # 失敗を黙殺せず画面に出す
             self.results, self.hits = [], []
@@ -376,6 +381,21 @@ class MainDialog(QDialog):
         self.show_hits()
         if not self.hits:
             self.status.setText("該当するデータはありませんでした (%s)" % self.source_combo.currentText())
+            self.explain_date_problem(conds, diag)
+
+    def explain_date_problem(self, conds, diag):
+        """日付条件で 0 件のとき、日付が読めなかったのが原因かを知らせる。"""
+        if not any(c.op in core.DATE_OPS and c.text for c in conds):
+            return
+        field = next(c.field for c in conds if c.op in core.DATE_OPS and c.text) or "(全項目)"
+        if diag["parsed"] == 0 and diag["failed"]:
+            QMessageBox.warning(
+                self, TITLE, "日付項目「%s」の値を日付として読み取れませんでした (%d 件)。\n\n読み取れなかった値の例:\n%s\n\n"
+                "この書式を開発者に伝えてください。" % (field, diag["failed"], "\n".join(diag["samples"])))
+        elif diag["parsed"] == 0:
+            QMessageBox.warning(
+                self, TITLE, "日付項目「%s」に値がありません。\n検索するレイヤに、この項目が含まれているか確認してください。\n"
+                "(別のExcelにある場合は、検索するレイヤを「すべてのレイヤを横断」にしてください)" % field)
 
     def parent_label(self, res):
         names = self.names[core.SRC_PARENT]
@@ -495,7 +515,7 @@ class MainDialog(QDialog):
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            preview.print_doc(self.build_document(res), preview.make_printer(path))
+            preview.write_pdf(self.build_document(res), path)
         finally:
             QApplication.restoreOverrideCursor()
         self.iface.messageBar().pushSuccess("PDF 出力", "%d 件を保存しました: %s" % (len(res), path))
@@ -526,7 +546,7 @@ class MainDialog(QDialog):
                 path = os.path.join(folder, core.safe_filename(owner, used) + ".pdf")
                 try:
                     doc = self.build_document(items, "%s %s 様" % (self.title_edit.text(), owner))
-                    preview.print_doc(doc, preview.make_printer(path))
+                    preview.write_pdf(doc, path)
                     saved += 1
                 except Exception as e:  # 1 人分の失敗で全体を止めない
                     errors.append("%s: %s" % (owner, e))
