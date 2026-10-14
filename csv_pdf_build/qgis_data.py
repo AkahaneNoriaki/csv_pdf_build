@@ -1,8 +1,9 @@
 """QGIS レイヤ/リレーションから core 用のレコードを作る。"""
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 
 from qgis.core import NULL, QgsFeatureRequest, QgsProject
 
+from . import core
 from .core import Result
 
 
@@ -37,22 +38,12 @@ def _key(feature, names):
     return tuple(to_text(feature[n]).strip() for n in names)
 
 
-def _children_by_key(relation, tick):
-    """子レイヤを 1 回だけ走査して、親キーごとにレコードをまとめる。
-
-    relation.getRelatedFeatures() を親ごとに呼ぶと、親の件数 x 子の件数の
-    検索になり (特に Excel は索引が無い)、極端に遅くなるため使わない。
-    """
-    layer = relation.referencingLayer()
-    pairs = relation.fieldPairs()          # {子の項目: 親の項目}
-    child_fields = list(pairs.keys())
-    names = field_names(layer)
-    groups = {}
-    request = QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry)
-    for c in layer.getFeatures(request):
-        tick()
-        groups.setdefault(_key(c, child_fields), []).append(feature_record(c, names))
-    return groups, [pairs[k] for k in child_fields]
+def _request():
+    """ジオメトリを読まない地物リクエスト (検索には不要で、読むと遅くなる)。"""
+    flag = getattr(QgsFeatureRequest, "NoGeometry", None)
+    if flag is None:
+        flag = QgsFeatureRequest.Flag.NoGeometry
+    return QgsFeatureRequest().setFlags(flag)
 
 
 def parent_layers():
@@ -71,31 +62,133 @@ def relation_label(relation):
     return relation.referencingLayer().name()
 
 
-def load_results(parent_layer, relations, selected_only=False, progress=None):
-    """親レイヤの地物と、全リレーション先のレコードを読み込む (各レイヤ 1 回の走査)。
+class _Scan:
+    """走査件数を数え、一定件数ごとに進捗を通知する。"""
 
-    子レコードは Result.children[relation.id()] に入る。
-    progress(done, total) が与えられると、一定件数ごとに呼び出す。
+    def __init__(self, progress):
+        self.progress = progress
+        self.n = 0
+        self.label = ""
+
+    def start(self, label):
+        self.label = label
+        if self.progress:
+            self.progress(label, self.n)
+
+    def tick(self):
+        self.n += 1
+        if self.progress and self.n % 2000 == 0:
+            self.progress(self.label, self.n)
+
+
+def search(parent_layer, relations, source, conditions, selected_only=False, progress=None):
+    """リレーションレイヤを事前に読み込まず、検索のたびに必要な分だけ読んで Result を返す。
+
+    1. 親レイヤを 1 回走査し、リレーションのキー -> 親の地物 ID の索引を作る
+    2. 検索対象レイヤ(リレーション先 Excel など)を 1 回走査し、条件に一致した
+       レコードが属する親の地物 ID を集める
+    3. 一致した親だけを取り出し、紐づく全リレーション先のレコードを集める
+       (一致したキーのレコードだけを保持する)
+    戻り値は Result (fid つき) のリスト。条件との突き合わせ(Hit 化)は呼び出し側が
+    core.search_records で行う。
     """
-    total = parent_layer.featureCount() + sum(r.referencingLayer().featureCount() for r in relations)
-    state = {"done": 0}
-
-    def tick():
-        state["done"] += 1
-        if progress and state["done"] % 500 == 0:
-            progress(state["done"], total)
-
+    active = [c for c in conditions if c.text]
+    scan = _Scan(progress)
     pnames = field_names(parent_layer)
-    rels = [(r.id(),) + _children_by_key(r, tick) for r in relations]
-    request = QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry)
-    feats = parent_layer.getSelectedFeatures(request) if selected_only else parent_layer.getFeatures(request)
+    rel_by_id = OrderedDict((r.id(), r) for r in relations)
+    cfields, pfields = {}, {}
+    for rid, r in rel_by_id.items():
+        pairs = r.fieldPairs()                    # {子の項目: 親の項目}
+        cfields[rid] = list(pairs.keys())
+        pfields[rid] = [pairs[k] for k in cfields[rid]]
+
+    selected = set(parent_layer.selectedFeatureIds()) if selected_only else None
+    need_parent_match = source in (core.SRC_PARENT, core.SRC_ALL)
+    index = {rid: defaultdict(list) for rid in rel_by_id}
+    all_fids = set()
+    parent_ok = set()                             # 親検索: 全条件に一致した親
+    parent_any = [set() for _ in active]          # 横断検索: 条件ごとに一致した親
+
+    # --- 1. 親レイヤ ---
+    scan.start("林地台帳を走査中: " + parent_layer.name())
+    for f in parent_layer.getFeatures(_request()):
+        scan.tick()
+        fid = f.id()
+        if selected is not None and fid not in selected:
+            continue
+        all_fids.add(fid)
+        for rid in rel_by_id:
+            key = _key(f, pfields[rid])
+            if any(key):
+                index[rid][key].append(fid)
+        if need_parent_match:
+            rec = feature_record(f, pnames)
+            if source == core.SRC_PARENT:
+                if all(core.record_matches(rec, c.field, c.op, c.text) for c in active):
+                    parent_ok.add(fid)
+            else:
+                for i, c in enumerate(active):
+                    if core.record_matches(rec, c.field, c.op, c.text):
+                        parent_any[i].add(fid)
+
+    # --- 2. 検索対象のリレーション先 ---
+    if source == core.SRC_PARENT:
+        fids = parent_ok
+    else:
+        targets = [source] if source in rel_by_id else list(rel_by_id)
+        child_ok = set()                          # リレーション先検索: 全条件に一致した親
+        for rid in targets:
+            layer = rel_by_id[rid].referencingLayer()
+            names = field_names(layer)
+            scan.start("検索中: " + layer.name())
+            for c in layer.getFeatures(_request()):
+                scan.tick()
+                owners = index[rid].get(_key(c, cfields[rid]))
+                if not owners:                    # 親に紐づかないレコードは対象外
+                    continue
+                rec = feature_record(c, names)
+                if source == core.SRC_ALL:
+                    for i, cond in enumerate(active):
+                        if core.record_matches(rec, cond.field, cond.op, cond.text):
+                            parent_any[i].update(owners)
+                elif all(core.record_matches(rec, cond.field, cond.op, cond.text) for cond in active):
+                    child_ok.update(owners)
+        if source == core.SRC_ALL:
+            fids = set.intersection(*parent_any) if active else set(all_fids)
+        else:
+            fids = child_ok
+
+    # --- 3. 一致した親と、その全リレーション先を取り出す ---
+    if not fids:
+        return []
+    scan.start("該当データを取得中")
+    request = _request().setFilterFids(sorted(fids))
+    parents = {f.id(): f for f in parent_layer.getFeatures(request)}
+    wanted = {rid: set() for rid in rel_by_id}
+    for f in parents.values():
+        for rid in rel_by_id:
+            key = _key(f, pfields[rid])
+            if any(key):
+                wanted[rid].add(key)
+    groups = {}
+    for rid, r in rel_by_id.items():
+        groups[rid] = defaultdict(list)
+        if not wanted[rid]:
+            continue
+        layer = r.referencingLayer()
+        names = field_names(layer)
+        scan.start("関連データを取得中: " + layer.name())
+        for c in layer.getFeatures(_request()):
+            scan.tick()
+            key = _key(c, cfields[rid])
+            if key in wanted[rid]:
+                groups[rid][key].append(feature_record(c, names))
+
     results = []
-    for f in feats:
-        tick()
-        children = {rid: groups.get(_key(f, pf), []) for rid, groups, pf in rels}
+    for fid in sorted(parents):
+        f = parents[fid]
+        children = {rid: groups[rid].get(_key(f, pfields[rid]), []) for rid in rel_by_id}
         res = Result(feature_record(f, pnames), children)
-        res.fid = f.id()
+        res.fid = fid
         results.append(res)
-    if progress:
-        progress(total, total)
     return results

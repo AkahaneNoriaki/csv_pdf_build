@@ -1,7 +1,8 @@
+import traceback
 from collections import OrderedDict
 
 from qgis.core import QgsProject
-from qgis.PyQt.QtCore import Qt, QTimer
+from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QFont, QFontDatabase, QTextDocument
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
@@ -106,8 +107,6 @@ class MainDialog(QDialog):
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(220)
         self.progress.setVisible(False)
-        b_reload = QPushButton("データ再読込")
-        b_reload.clicked.connect(self.load_data)
         b_sel = QPushButton("地図で選択")
         b_zoom = QPushButton("選択して拡大")
         b_sel.clicked.connect(lambda: self.select_on_map(False))
@@ -116,11 +115,10 @@ class MainDialog(QDialog):
         h.addWidget(self.progress)
         h.addWidget(b_sel)
         h.addWidget(b_zoom)
-        h.addWidget(b_reload)
         root.addLayout(h)
 
         # --- 2. 検索レイヤ選択 ---
-        box = QGroupBox("2. 検索レイヤ選択 (選ぶとリレーション先も自動で読み込みます)")
+        box = QGroupBox("2. 検索レイヤ選択 (リレーション先は自動で検出し、検索時に必要な分だけ読みます)")
         form = QFormLayout(box)
         self.layer_combo = QComboBox()
         self.related_label = QLabel("")
@@ -181,9 +179,8 @@ class MainDialog(QDialog):
         form.addRow(h)
         root.addWidget(box)
 
-        self.layer_combo.currentIndexChanged.connect(lambda *_: self.on_layer_changed(load=True))
+        self.layer_combo.currentIndexChanged.connect(lambda *_: self.on_layer_changed())
         self.source_combo.currentIndexChanged.connect(self.on_source_changed)
-        self.selected_only.currentIndexChanged.connect(lambda *_: self.load_data())
         self.add_condition()
 
     @staticmethod
@@ -195,10 +192,6 @@ class MainDialog(QDialog):
                 return f
         return QFont().family()
 
-    def showEvent(self, event):
-        super().showEvent(event)
-        QTimer.singleShot(0, self.load_data)   # 開いたときに最新データを読み込む
-
     # ---------- レイヤ選択 ----------
     def refresh_layers(self):
         """リレーションの親になっているレイヤを列挙する (プラグインを開くたびに呼ぶ)。"""
@@ -209,12 +202,12 @@ class MainDialog(QDialog):
             self.layer_combo.addItem(layer.name(), layer.id())
         self.layer_combo.setCurrentIndex(max(self.layer_combo.findData(keep), 0))
         self.layer_combo.blockSignals(False)
-        self.on_layer_changed(load=self.isVisible())
+        self.on_layer_changed()
         if not self.layer_combo.count():
             self.status.setText("リレーションが設定されたレイヤがありません。"
                                 "プロジェクトのプロパティ > リレーション で設定してください。")
 
-    def on_layer_changed(self, load=False):
+    def on_layer_changed(self):
         layer = QgsProject.instance().mapLayer(self.layer_combo.currentData() or "")
         self.parent_layer = layer
         self.relations = qgis_data.relations_for(layer)
@@ -259,8 +252,6 @@ class MainDialog(QDialog):
             row.update_fields()
         self.results, self.hits = [], []
         self.show_hits()
-        if load:
-            QTimer.singleShot(0, self.load_data)
 
     def search_source(self):
         return self.source_combo.currentData() or core.SRC_ALL
@@ -299,37 +290,9 @@ class MainDialog(QDialog):
             w.deleteLater()
         self.cond_layout.removeItem(row)
 
-    # ---------- 読み込み・検索 ----------
-    def load_data(self):
-        """親レイヤとリレーション先を先にまとめて読み込む (検索はこのデータに対して行う)。"""
-        self.results, self.hits = [], []
-        layer = self.parent_layer
-        if layer is None:
-            self.show_hits()
-            return
-        self.setEnabled(False)   # 読み込み中は操作を受け付けない
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-
-        def progress(done, total):
-            self.progress.setValue(int(done * 100 / max(total, 1)))
-            self.status.setText("データを読み込み中... %d / %d" % (done, total))
-            QApplication.processEvents()
-
-        try:
-            self.results = qgis_data.load_results(
-                layer, self.relations, self.selected_only.currentData(), progress)
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.progress.setVisible(False)
-            self.setEnabled(True)
-        self.show_hits()
-        self.status.setText("読み込み完了: %s %d 件 (リレーション先 %d レイヤ)。条件を入れて検索してください。"
-                            % (layer.name(), len(self.results), len(self.relations)))
-
+    # ---------- 検索 ----------
     def do_search(self):
+        """リレーション先(Excel)などを検索し、一致した親レイヤと紐づく情報を取り出す。"""
         if self.parent_layer is None:
             QMessageBox.warning(self, TITLE, "リレーション済みのレイヤを選択してください。")
             return
@@ -338,10 +301,30 @@ class MainDialog(QDialog):
         if err:
             QMessageBox.warning(self, TITLE, err)
             return
-        if not self.results:
-            self.load_data()
-        self.hits = core.search_records(self.results, self.search_source(), conds)
+        self.setEnabled(False)   # 検索中は操作を受け付けない
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 0)   # 件数不明の動作表示
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        def progress(label, count):
+            self.status.setText("%s (%d 件処理)" % (label, count))
+            QApplication.processEvents()
+
+        try:
+            self.results = qgis_data.search(
+                self.parent_layer, self.relations, self.search_source(), conds,
+                self.selected_only.currentData(), progress)
+            self.hits = core.search_records(self.results, self.search_source(), conds)
+        except Exception:  # 失敗を黙殺せず画面に出す
+            self.results, self.hits = [], []
+            QMessageBox.critical(self, TITLE, "検索中にエラーが発生しました:\n\n" + traceback.format_exc())
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.progress.setVisible(False)
+            self.setEnabled(True)
         self.show_hits()
+        if not self.hits:
+            self.status.setText("該当するデータはありませんでした (%s)" % self.source_combo.currentText())
 
     def parent_label(self, res):
         names = self.names[core.SRC_PARENT]
@@ -382,7 +365,7 @@ class MainDialog(QDialog):
             for c, val in enumerate(vals):
                 self.table.setItem(r, c, QTableWidgetItem(val))
         self.table.resizeColumnsToContents()
-        if self.hits or self.results:
+        if self.hits:
             self.status.setText("検索結果: %d 件 (%s)" % (len(self.rows), self.source_combo.currentText()))
 
     def target_hits(self):
