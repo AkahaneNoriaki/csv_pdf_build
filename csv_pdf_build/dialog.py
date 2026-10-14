@@ -246,7 +246,11 @@ class MainDialog(QDialog):
         self.source_combo.addItem("親: " + self.labels[core.SRC_PARENT], core.SRC_PARENT)
         self.source_combo.addItem("すべてのレイヤを横断", core.SRC_ALL)
         i = self.source_combo.findData(keep)
-        self.source_combo.setCurrentIndex(max(i, 0))
+        if i < 0:   # 初回は、氏名・所有者の項目を持つリレーション先を検索レイヤの初期値にする
+            i = next((k for k in range(self.source_combo.count())
+                      if self.source_combo.itemData(k) in self.relation_ids()
+                      and any(("氏名" in n or "所有者" in n) for n in self.names[self.source_combo.itemData(k)])), 0)
+        self.source_combo.setCurrentIndex(i)
         self.source_combo.blockSignals(False)
 
         # 出力項目タブ
@@ -272,6 +276,9 @@ class MainDialog(QDialog):
         self.update_owner_combo()
         self.results, self.hits = [], []
         self.show_hits()
+
+    def relation_ids(self):
+        return [r.id() for r in self.relations]
 
     def update_period_fields(self):
         """期間指定の日付項目。入力年月日・更新日などを既定にする。"""
@@ -442,12 +449,15 @@ class MainDialog(QDialog):
         for src, label in self.labels.items():
             for n in self.names[src]:
                 self.owner_combo.addItem("%s: %s" % (label, n), (src, n))
-        for key in ("所有者", "氏名"):
-            hit = next((i for i in range(self.owner_combo.count())
-                        if key in self.owner_combo.itemData(i)[1]), -1)
-            if hit >= 0:
-                self.owner_combo.setCurrentIndex(hit)
-                break
+        # 氏名・所有者はリレーション先の項目を優先する (親より先に探す)
+        order = [s for s in self.labels if s != core.SRC_PARENT] + [core.SRC_PARENT]
+        for key in ("所有者氏名", "氏名", "所有者"):
+            for src in order:
+                hit = next((i for i in range(self.owner_combo.count())
+                            if self.owner_combo.itemData(i)[0] == src and key in self.owner_combo.itemData(i)[1]), -1)
+                if hit >= 0:
+                    self.owner_combo.setCurrentIndex(hit)
+                    return
 
     def build_document(self, res, title=None):
         html = core.build_html(res, self.checked_fields(), self.labels,
