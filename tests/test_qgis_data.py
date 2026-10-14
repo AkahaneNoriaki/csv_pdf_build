@@ -132,6 +132,19 @@ class SearchTest(unittest.TestCase):
         cond = [c(None, "contains", "山田"), c(None, "contains", "ヒノキ")]
         self.assertEqual(qgis_data.search(parent, rels, core.SRC_ALL, cond), [])
 
+    def test_period_on_other_layer(self):
+        """期間指定は検索するレイヤと別のレイヤ (林地台帳マスターなど) の項目でも絞り込める。"""
+        parent, rels, *_ = setup()
+        period = [core.Condition("更新日", "date_from", "令和6年4月1日", "d"),
+                  core.Condition("更新日", "date_to", "R6.6.30", "d")]
+        res = qgis_data.search(parent, rels, "f", period)                 # 森林簿を検索
+        self.assertEqual([r.fid for r in res], [2])
+        self.assertEqual(len(core.search_records(res, "f", period)), 1)   # 森林簿の 1 件
+        cond = [c("樹種", "contains", "スギ")] + period                    # 条件と期間の AND
+        self.assertEqual(qgis_data.search(parent, rels, "f", cond), [])
+        res = qgis_data.search(parent, rels, core.SRC_PARENT, period)
+        self.assertEqual([r.fid for r in res], [2])
+
     def test_no_match_and_scan_counts(self):
         parent, rels, detail, forest = setup()
         self.assertEqual(qgis_data.search(parent, rels, "d", [c("氏名", "contains", "存在しない")]), [])

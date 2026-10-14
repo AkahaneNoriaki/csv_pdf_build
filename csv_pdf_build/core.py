@@ -38,6 +38,8 @@ _ERA_RE = re.compile(_ERA + r"\s*\.?\s*(元|\d+)\s*(?:年|" + _SEP + r")\s*(\d{1
 _ERA_COMPACT_RE = re.compile(_ERA + r"\s*\.?\s*(\d{2})(\d{2})(\d{2})(?!\d)")
 _WEST_RE = re.compile(r"(\d{4})\s*(?:年|" + _SEP + r")\s*(\d{1,2})\s*(?:月|" + _SEP + r")?\s*(?:(\d{1,2})\s*日?)?")
 _WEST_COMPACT_RE = re.compile(r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)")
+_SERIAL_RE = re.compile(r"^(\d{5})(?:\.\d+)?$")   # Excel の日付シリアル値 (46160 = 2026-05-18)
+_EXCEL_EPOCH = datetime.date(1899, 12, 30)
 _KANJI_RE = re.compile(r"[〇一二三四五六七八九十]+")
 _KANJI_DIGITS = {c: str(i) for i, c in enumerate("〇一二三四五六七八九")}
 
@@ -58,10 +60,14 @@ def parse_date(text):
     """和暦・西暦の日付文字列を date にする。読み取れなければ None。
 
     対応例: 令和6年5月1日 / 令和元年5月1日 / 令6.4.1 / R06.04.01 / 令和060401 /
-    令和六年四月一日 / 2024/5/1 / 2024年5月1日 / 20240501 / 2024-05-01T10:00:00
-    日が無い場合は 1 日として扱う。
+    令和六年四月一日 / 2024/5/1 / 2024年5月1日 / 20240501 / 2024-05-01T10:00:00 /
+    46160 (Excel のシリアル値、1954〜2119 年の範囲のみ)
+    日・月が無いか 00 の場合は 1 日・1 月として扱う (明治33年01月00日 など)。
     """
     t = unicodedata.normalize("NFKC", str(text)).upper().strip()
+    m = _SERIAL_RE.match(t)
+    if m and 20000 <= int(m.group(1)) <= 80000:
+        return _EXCEL_EPOCH + datetime.timedelta(days=int(m.group(1)))
     t = _KANJI_RE.sub(_kanji_to_arabic, t)
     m = _ERA_RE.search(t)
     if m:
@@ -78,7 +84,7 @@ def parse_date(text):
                 return None
             year, mo, d = int(m.group(1)), m.group(2), m.group(3)
     try:
-        return datetime.date(year, int(mo), int(d) if d else 1)
+        return datetime.date(year, int(mo) or 1, int(d or 0) or 1)
     except ValueError:
         return None
 
@@ -98,12 +104,30 @@ ENCODINGS = OrderedDict([
 
 
 class Condition:
-    """検索条件。field が None のときは全項目が対象。"""
+    """検索条件。field が None のときは全項目が対象。
 
-    def __init__(self, field, op, text):
+    source を指定すると、検索するレイヤとは別のレイヤ (期間指定の林地台帳マスターなど) の
+    項目で絞り込む。None のときは検索するレイヤが対象。
+    """
+
+    def __init__(self, field, op, text, source=None):
         self.field = field
         self.op = op
         self.text = text
+        self.source = source
+
+
+def split_conditions(conditions, source):
+    """入力のある条件を (検索するレイヤの条件, {別レイヤの source: [条件]}) に分ける。"""
+    own, other = [], OrderedDict()
+    for c in conditions:
+        if not c.text:
+            continue
+        if c.source is None or c.source == source:
+            own.append(c)
+        else:
+            other.setdefault(c.source, []).append(c)
+    return own, other
 
 
 class Result:
@@ -179,8 +203,9 @@ def search_records(results, source, conditions):
 
     source が SRC_ALL のときは、親と全リレーション先を横断し、各条件が
     どこかのレコードに一致する林地台帳を (親レコードの Hit として) 返す。
+    別レイヤの条件 (source 指定) は qgis_data.search で絞り込み済みなので、ここでは見ない。
     """
-    active = [c for c in conditions if c.text]
+    active = split_conditions(conditions, source)[0]
     hits = []
     for res in results:
         if source == SRC_ALL:

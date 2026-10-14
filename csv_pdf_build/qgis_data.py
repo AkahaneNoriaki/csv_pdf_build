@@ -113,8 +113,10 @@ def search(parent_layer, relations, source, conditions, selected_only=False, pro
     戻り値は Result (fid つき) のリスト。条件との突き合わせ(Hit 化)は呼び出し側が
     core.search_records で行う。diag (new_date_diag()) を渡すと、日付条件の項目が
     日付として読めた件数と、読めなかった値の例が入る。
+    source を指定した条件 (期間指定など) は、そのレイヤのレコードで一致した親だけに絞り込む。
     """
-    active = [c for c in conditions if c.text]
+    active, other = core.split_conditions(conditions, source)
+    other_parent = other.pop(core.SRC_PARENT, [])
     scan = _Scan(progress)
     pnames = field_names(parent_layer)
     rel_by_id = OrderedDict((r.id(), r) for r in relations)
@@ -130,6 +132,7 @@ def search(parent_layer, relations, source, conditions, selected_only=False, pro
     all_fids = set()
     parent_ok = set()                             # 親検索: 全条件に一致した親
     parent_any = [set() for _ in active]          # 横断検索: 条件ごとに一致した親
+    other_ok = set()                              # 別レイヤ条件のうち親レイヤ分に一致した親
 
     # --- 1. 親レイヤ ---
     scan.start("林地台帳を走査中: " + parent_layer.name())
@@ -143,6 +146,12 @@ def search(parent_layer, relations, source, conditions, selected_only=False, pro
             key = _key(f, pfields[rid])
             if any(key):
                 index[rid][key].append(fid)
+        if other_parent:
+            rec = feature_record(f, pnames)
+            if diag is not None:
+                _date_diag(rec, other_parent, diag)
+            if all(core.record_matches(rec, c.field, c.op, c.text) for c in other_parent):
+                other_ok.add(fid)
         if need_parent_match:
             rec = feature_record(f, pnames)
             if diag is not None:
@@ -158,6 +167,8 @@ def search(parent_layer, relations, source, conditions, selected_only=False, pro
     # --- 2. 検索対象のリレーション先 ---
     if source == core.SRC_PARENT:
         fids = parent_ok
+    elif not active and (other or other_parent):
+        fids = set(all_fids)                      # 別レイヤの条件だけで絞るので走査は不要
     else:
         targets = [source] if source in rel_by_id else list(rel_by_id)
         child_ok = set()                          # リレーション先検索: 全条件に一致した親
@@ -183,6 +194,31 @@ def search(parent_layer, relations, source, conditions, selected_only=False, pro
             fids = set.intersection(*parent_any) if active else set(all_fids)
         else:
             fids = child_ok
+
+    # --- 2b. 別レイヤの条件 (期間指定など) で絞り込む ---
+    if other_parent:
+        fids &= other_ok
+    for rid, conds in other.items():
+        if not fids:
+            break
+        if rid not in rel_by_id:                  # 今の親レイヤに無いリレーションの条件
+            fids = set()
+            break
+        layer = rel_by_id[rid].referencingLayer()
+        names = field_names(layer)
+        ok = set()
+        scan.start("絞り込み中: " + layer.name())
+        for c in layer.getFeatures(_request()):
+            scan.tick()
+            owners = index[rid].get(_key(c, cfields[rid]))
+            if not owners:
+                continue
+            rec = feature_record(c, names)
+            if diag is not None:
+                _date_diag(rec, conds, diag)
+            if all(core.record_matches(rec, cond.field, cond.op, cond.text) for cond in conds):
+                ok.update(owners)
+        fids &= ok
 
     # --- 3. 一致した親と、その全リレーション先を取り出す ---
     if not fids:

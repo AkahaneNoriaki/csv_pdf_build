@@ -82,6 +82,10 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(p("令和二十年1月1日"), dt.date(2038, 1, 1))
         self.assertIsNone(p("山林"))
         self.assertIsNone(p("令和6年13月1日"))
+        self.assertEqual(p("46160"), dt.date(2026, 5, 18))           # Excel のシリアル値
+        self.assertEqual(p("46160.0"), dt.date(2026, 5, 18))
+        self.assertIsNone(p("12345"))                                 # 範囲外の 5 桁は日付にしない
+        self.assertEqual(p("明治33年01月00日"), dt.date(1900, 1, 1))   # 日が 00
 
     def test_date_search(self):
         data = [core.Result(O(氏名="A", 更新日="令和6年4月1日")),

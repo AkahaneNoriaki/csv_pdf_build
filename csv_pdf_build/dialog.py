@@ -302,14 +302,18 @@ class MainDialog(QDialog):
         return [r.id() for r in self.relations]
 
     def update_period_fields(self):
-        """期間指定の日付項目。入力年月日・更新日などを既定にする。"""
+        """期間指定の日付項目。検索するレイヤに関係なく、全レイヤの項目から選べる。
+
+        林地台帳マスターの現_届出 (届出日) を既定にする。
+        """
         self.period_field.clear()
-        self.period_field.addItem(ALL_FIELDS, None)
-        for n in self.names.get(self.search_source(), []):
-            self.period_field.addItem(n, n)
-        for key in ("届け出年月日", "届出年月日", "入力年月日", "年月日", "更新日", "日"):
-            hit = next((i for i in range(self.period_field.count())
-                        if key in (self.period_field.itemData(i) or "")), -1)
+        self.period_field.addItem("(検索するレイヤの全項目)", None)
+        for src, label in self.labels.items():
+            for n in self.names[src]:
+                self.period_field.addItem("%s: %s" % (label, n), (src, n))
+        for key in ("現_届出", "届け出年月日", "届出年月日", "入力年月日", "年月日", "更新日"):
+            hit = next((i for i in range(1, self.period_field.count())
+                        if key in self.period_field.itemData(i)[1]), -1)
             if hit >= 0:
                 self.period_field.setCurrentIndex(hit)
                 break
@@ -317,11 +321,11 @@ class MainDialog(QDialog):
     def current_conditions(self):
         """条件行 + 期間指定 (開始日以降・終了日以前) をまとめた検索条件。"""
         conds = [r.condition() for r in self.cond_rows]
-        field = self.period_field.currentData()
+        src, field = self.period_field.currentData() or (None, None)
         if self.period_from.text().strip():
-            conds.append(core.Condition(field, "date_from", self.period_from.text().strip()))
+            conds.append(core.Condition(field, "date_from", self.period_from.text().strip(), src))
         if self.period_to.text().strip():
-            conds.append(core.Condition(field, "date_to", self.period_to.text().strip()))
+            conds.append(core.Condition(field, "date_to", self.period_to.text().strip(), src))
         return conds
 
     def search_source(self):
@@ -330,7 +334,6 @@ class MainDialog(QDialog):
     def on_source_changed(self, *_):
         for row in self.cond_rows:
             row.update_fields()
-        self.update_period_fields()
         self.hits = []
         self.show_hits()
 
@@ -412,7 +415,7 @@ class MainDialog(QDialog):
         elif diag["parsed"] == 0:
             QMessageBox.warning(
                 self, TITLE, "日付項目「%s」に値がありません。\n検索するレイヤに、この項目が含まれているか確認してください。\n"
-                "(別のExcelにある場合は、検索するレイヤを「すべてのレイヤを横断」にしてください)" % field)
+                "(別のExcelにある場合は、期間指定の項目で「レイヤ名: 項目名」を選んでください)" % field)
 
     def parent_label(self, res):
         names = self.names[core.SRC_PARENT]
