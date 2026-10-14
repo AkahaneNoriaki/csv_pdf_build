@@ -526,9 +526,9 @@ class MainDialog(QDialog):
         for src, label in self.labels.items():
             for n in self.names[src]:
                 self.owner_combo.addItem("%s: %s" % (label, n), (src, n))
-        # 氏名・所有者はリレーション先の項目を優先する (親より先に探す)
+        # 届出番号があればそれで分ける。無ければ氏名・所有者 (リレーション先を親より先に探す)
         order = [s for s in self.labels if s != core.SRC_PARENT] + [core.SRC_PARENT]
-        for key in ("所有者氏名", "氏名", "所有者"):
+        for key in (core.NUMBER_FIELD, "所有者氏名", "氏名", "所有者"):
             for src in order:
                 hit = next((i for i in range(self.owner_combo.count())
                             if self.owner_combo.itemData(i)[0] == src and key in self.owner_combo.itemData(i)[1]), -1)
@@ -654,6 +654,13 @@ class MainDialog(QDialog):
             return
         self.iface.messageBar().pushSuccess("PDF 出力", "%d 件を保存しました: %s" % (len(res), path))
 
+    def owner_name(self, results, source):
+        """届出番号で分けたときのタイトル用の氏名 (同じレイヤの 現_氏名 など)。"""
+        names = self.names.get(source, [])
+        field = next((n for n in ("現_氏名", "所有者氏名", "氏名") if n in names), None)
+        values = core.result_values(results, source, field) if field else set()
+        return "・".join(sorted(values))
+
     def export_owner_pdfs(self):
         """検索結果を所有者ごとに分け、所有者ごとに 1 つの PDF を作る。"""
         data = self.owner_combo.currentData()
@@ -663,11 +670,17 @@ class MainDialog(QDialog):
         if not res:
             return
         groups = core.group_by_owner(res, data[0], data[1])
+        by_number = data[1] == core.NUMBER_FIELD
+        skipped = len(groups.pop(core.UNKNOWN_OWNER, [])) if by_number else 0   # 番号の無い届出は出力しない
+        if not groups:
+            QMessageBox.information(self, TITLE, "届出番号の付いた検索結果がありません。Excel の「届出番号」列を確認してください。")
+            return
         folder = QFileDialog.getExistingDirectory(self, "所有者別PDFの保存先フォルダ")
         if not folder:
             return
+        note = "\n(届出番号の無い %d 件は出力しません)" % skipped if skipped else ""
         ok = QMessageBox.question(
-            self, TITLE, "%d 人分の PDF を作成します。\n保存先: %s\n\nよろしいですか?" % (len(groups), folder))
+            self, TITLE, "%d 件分の PDF を作成します。\n保存先: %s%s\n\nよろしいですか?" % (len(groups), folder, note))
         if ok != QMessageBox.StandardButton.Yes:
             return
         used, saved, errors = set(), 0, []
@@ -679,7 +692,10 @@ class MainDialog(QDialog):
                 QApplication.processEvents()
                 path = os.path.join(folder, core.safe_filename(owner, used) + ".pdf")
                 try:
-                    built = self.build_print(items, "%s %s 様" % (self.title_edit.text(), owner))
+                    title = "%s %s 様" % (self.title_edit.text(), owner)
+                    if by_number:      # ファイル名は ina2026001.pdf、タイトルは「林地台帳 ina2026001 氏名 様」
+                        title = "%s %s %s 様" % (self.title_edit.text(), owner, self.owner_name(items, data[0]))
+                    built = self.build_print(items, title)
                     try:
                         err = built.export_pdf(path)
                     finally:
@@ -692,7 +708,7 @@ class MainDialog(QDialog):
         finally:
             QApplication.restoreOverrideCursor()
             self.setEnabled(True)
-        msg = "%d / %d 人分の PDF を保存しました: %s" % (saved, len(groups), folder)
+        msg = "%d / %d 件分の PDF を保存しました: %s" % (saved, len(groups), folder)
         self.status.setText(msg)
         if errors:
             QMessageBox.warning(self, TITLE, msg + "\n\n失敗:\n" + "\n".join(errors[:20]))

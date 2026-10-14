@@ -332,6 +332,7 @@ def build_html(results, fields, labels, title="林地台帳 出力", font_family
     return "".join(parts)
 
 
+NUMBER_FIELD = "届出番号"   # 所有者別PDFをこの項目で分けると ina2026001.pdf のように保存する
 UNKNOWN_OWNER = "(所有者不明)"
 
 
