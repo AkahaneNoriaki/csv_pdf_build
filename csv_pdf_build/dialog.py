@@ -1,12 +1,12 @@
 from qgis.core import QgsMapLayerProxyModel
 from qgis.gui import QgsMapLayerComboBox
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtGui import QFont, QFontDatabase, QPageLayout, QPageSize, QTextDocument
 from qgis.PyQt.QtPrintSupport import QPrinter
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFontComboBox, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
+    QMessageBox, QProgressBar, QPushButton, QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout,
 )
 
 from . import core, qgis_data
@@ -62,7 +62,6 @@ class MainDialog(QDialog):
         self.setWindowTitle("林地台帳 CSV/PDF 出力")
         self.resize(900, 720)
         self.results = []      # 全件 (読み込み済みキャッシュ)
-        self._cache_key = None
         self.hits = []         # 検索結果
         self.names = {s: [] for s in SOURCES}
         self.rows = []
@@ -105,8 +104,17 @@ class MainDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         root.addWidget(self.table, 1)
+        h = QHBoxLayout()
         self.status = QLabel("")
-        root.addWidget(self.status)
+        self.progress = QProgressBar()
+        self.progress.setMaximumWidth(220)
+        self.progress.setVisible(False)
+        b_reload = QPushButton("データ再読込")
+        b_reload.clicked.connect(self.load_data)
+        h.addWidget(self.status, 1)
+        h.addWidget(self.progress)
+        h.addWidget(b_reload)
+        root.addLayout(h)
 
         # --- 2. レイヤ・リレーション設定 ---
         box = QGroupBox("2. レイヤ・リレーション設定 (通常は自動で設定されます)")
@@ -171,6 +179,7 @@ class MainDialog(QDialog):
         self.detail_combo.currentIndexChanged.connect(self.on_relation_changed)
         self.forest_combo.currentIndexChanged.connect(self.on_relation_changed)
         self.source_combo.currentIndexChanged.connect(self.on_source_changed)
+        self.selected_only.currentIndexChanged.connect(lambda *_: self.load_data())
         self.add_condition()
 
     # ---------- 設定 ----------
@@ -184,7 +193,6 @@ class MainDialog(QDialog):
         return QFont().family()
 
     def refresh_layers(self):
-        self.results = []  # 開き直したときは最新データを読み直す
         self.on_layer_changed(self.layer_combo.currentLayer())
 
     def on_layer_changed(self, layer):
@@ -232,6 +240,8 @@ class MainDialog(QDialog):
             row.update_fields()
         self.results, self.hits = [], []
         self.show_hits()
+        if self.isVisible():
+            QTimer.singleShot(0, self.load_data)
 
     def update_source_combo(self, layer, rels):
         """検索レイヤの選択肢を、実際に使えるレイヤ名で作り直す。"""
@@ -246,6 +256,10 @@ class MainDialog(QDialog):
         i = self.source_combo.findData(keep)
         self.source_combo.setCurrentIndex(max(i, 0))
         self.source_combo.blockSignals(False)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self.load_data)   # 開いたときに最新データを読み込む
 
     def search_source(self):
         return self.source_combo.currentData() or core.SRC_PARENT
@@ -285,28 +299,41 @@ class MainDialog(QDialog):
         self.cond_layout.removeItem(row)
 
     # ---------- 検索 ----------
-    def do_search(self):
+    def load_data(self):
+        """林地台帳とリレーション先を先にまとめて読み込む (検索はこのデータに対して行う)。"""
         layer = self.layer_combo.currentLayer()
+        self.results, self.hits = [], []
         if layer is None:
+            self.show_hits()
+            return
+        self.setEnabled(False)   # 読み込み中は操作を受け付けない
+        self.progress.setVisible(True)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        def progress(done, total):
+            self.progress.setValue(int(done * 100 / max(total, 1)))
+            self.status.setText("データを読み込み中... %d / %d" % (done, total))
+            QApplication.processEvents()
+
+        try:
+            self.results = qgis_data.load_results(
+                layer, self.relation(self.detail_combo), self.relation(self.forest_combo),
+                self.selected_only.currentData(), progress)
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.progress.setVisible(False)
+            self.setEnabled(True)
+        self.show_hits()
+        self.status.setText("読み込み完了: 林地台帳 %d 件。条件を入れて検索してください。" % len(self.results))
+
+    def do_search(self):
+        if self.layer_combo.currentLayer() is None:
             QMessageBox.warning(self, "林地台帳 CSV/PDF 出力", "林地台帳レイヤを選択してください。")
             return
-        cache_key = (layer.id(), self.detail_combo.currentData(),
-                     self.forest_combo.currentData(), self.selected_only.currentData())
-        if self.results and self._cache_key == cache_key and not self.selected_only.currentData():
-            pass  # 同じ設定なら読み込み済みデータで検索 (再読込しない)
-        else:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            self.status.setText("データを読み込み中...")
-            QApplication.processEvents()
-            try:
-                self.results = qgis_data.load_results(
-                    layer, self.relation(self.detail_combo), self.relation(self.forest_combo),
-                    self.selected_only.currentData())
-                self._cache_key = cache_key
-            finally:
-                QApplication.restoreOverrideCursor()
-        self.status.setText("検索中...")
-        QApplication.processEvents()
+        if not self.results:
+            self.load_data()
         self.hits = core.search_records(self.results, self.search_source(),
                                         [r.condition() for r in self.cond_rows])
         self.show_hits()
