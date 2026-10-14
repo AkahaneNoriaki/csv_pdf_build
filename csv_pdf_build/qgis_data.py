@@ -2,6 +2,7 @@
 from collections import OrderedDict, defaultdict
 
 from qgis.core import NULL, QgsFeatureRequest, QgsProject
+from qgis.PyQt.QtCore import QDate, QDateTime
 
 from . import core
 from .core import Result
@@ -10,6 +11,10 @@ from .core import Result
 def to_text(value):
     if value is None or value == NULL:
         return ""
+    if isinstance(value, QDateTime):        # 既定の toString() は「月 9月 1 2025」になり日付として読めない
+        return value.toString("yyyy-MM-dd HH:mm:ss")
+    if isinstance(value, QDate):
+        return value.toString("yyyy-MM-dd")
     if hasattr(value, "toString"):
         return value.toString()
     if isinstance(value, float) and value.is_integer():

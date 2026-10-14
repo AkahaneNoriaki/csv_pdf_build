@@ -4,6 +4,8 @@
 ズームする。下部に、林地台帳と紐づくリレーション先(森林簿など)の情報欄を置ける。
 重ねる図形 (Overlay: 施業班など) を指定すると、キーが一致する地物を青で強調して一緒に描く。
 """
+import unicodedata
+from collections import OrderedDict
 from html import escape
 
 from qgis.core import (
@@ -50,13 +52,16 @@ class Overlay:
 
 class Options:
     def __init__(self, landscape=True, scale=0, show_info=True, font="sans-serif", label_field=None,
-                 overlay=None):
+                 overlay=None, list_field=None, heads=None, key_fields=None):
         self.landscape = landscape
         self.scale = scale              # 0 = 対象に合わせて自動
         self.show_info = show_info
         self.font = font
         self.label_field = label_field  # 地図上のラベルに使う親レイヤの項目
         self.overlay = overlay          # Overlay または None
+        self.list_field = list_field    # まとめページの情報欄に並べる親レイヤの項目 (所在KEY など)
+        self.heads = heads or {}        # 情報欄の見出し {source: 変更林地 / 林地台帳 / 森林簿}
+        self.key_fields = key_fields or {}   # 情報欄にその項目の値だけを並べるレイヤ {source: INAKEY}
 
 
 class PageSpec:
@@ -72,7 +77,7 @@ def make_specs(results, each, title, title_of):
     """each=True: 1 件 1 ページ。False: 全件をまとめて 1 ページ。"""
     if not each:
         return [PageSpec(title, list(results))] if results else []
-    return [PageSpec("%s %s" % (title, title_of(r)), [r]) for r in results]
+    return [PageSpec(("%s %s" % (title, title_of(r))).strip(), [r]) for r in results]
 
 
 class Built:
@@ -114,6 +119,9 @@ class Built:
 # ---------- 強調表示レイヤ ----------
 PARCEL_COLOR = (220, 0, 0)     # 林地台帳 (赤)
 OVERLAY_COLOR = (0, 80, 220)   # 重ねる図形 (青)
+LEGEND_PARCEL = "林地"         # 凡例の表示名
+LEGEND_OVERLAY = "森林"
+SUMMARY_HEAD = "変更林地一覧"  # まとめページの情報欄の見出し
 
 
 def _symbol(gtype, overlay):
@@ -169,25 +177,68 @@ def _highlight_layer(source_layer, fids, label_field, name, overlay=False):
 
 # ---------- 情報欄の文章 ----------
 def _short(rec, fields):
+    rec = core.format_record(rec, wareki=True)      # 日付は 令和8年5月27日 の形で載せる
     return " / ".join(rec.get(f, "") for f in fields if rec.get(f, ""))
 
 
-def info_columns(results, fields, labels):
-    """情報欄の列 [(見出し, 本文), ...]。1 件なら親 + 各リレーション先、複数件なら一覧。"""
+def _width(text):
+    """全角を 1、半角を 0.55 とした表示幅。"""
+    return sum(1 if unicodedata.east_asian_width(ch) in "WF" else 0.55 for ch in text)
+
+
+def _listing(values, line_width=80, max_lines=8):
+    """値を「、」区切りで並べ、line_width (全角文字数) ごとに改行した文章。
+
+    印刷レイアウトのラベルは自動で折り返さないため、ここで改行する。max_lines 行に
+    入りきらない分は「…他 N 件」にする。
+    """
+    lines = [[]]                            # 行ごとの値のリスト
+    for v in values:
+        if lines[-1] and _width("、".join(lines[-1] + [v]) + "、") > line_width:
+            lines.append([])
+        lines[-1].append(v)
+    if len(lines) > max_lines:              # 入りきらない分は最後の行を削って「…他 N 件」にする
+        lines = lines[:max_lines]
+        shown = sum(len(l) for l in lines)
+        while lines[-1] and _width("、".join(lines[-1]) + "、…他 %d 件" % (len(values) - shown)) > line_width:
+            lines[-1].pop()
+            shown -= 1
+        lines[-1].append("…他 %d 件" % (len(values) - shown))
+    return "、\n".join("、".join(l) for l in lines)
+
+
+def info_columns(results, fields, labels, list_field=None, line_width=80, max_lines=8,
+                 heads=None, key_fields=None):
+    """情報欄の列 [(見出し, 本文), ...]。
+
+    1 件なら親 + 各リレーション先の列。見出しは heads {source: 名前} (無ければレイヤ名)。
+    key_fields {source: 項目} のレイヤは、その項目の値 (森林簿の INAKEY など) を重複なしで並べる。
+    複数件なら親レイヤの list_field (所在KEY など) を「、」区切りで並べる。
+    いずれも枠に入りきらない分は「…他 N 件」とする。
+    """
+    heads, key_fields = heads or {}, key_fields or {}
     if len(results) != 1:
-        pf = fields.get(core.SRC_PARENT, [])[:4]
-        lines = [_short(r.parent, pf) for r in results[:25]]
-        if len(results) > 25:
-            lines.append("…他 %d 件" % (len(results) - 25))
-        return [("%s (%d 件)" % (labels[core.SRC_PARENT], len(results)), "\n".join(lines))]
+        field = list_field or (fields.get(core.SRC_PARENT) or [None])[0]
+        values = [r.parent.get(field, "") for r in results] if field else []
+        head = "%s (%d 件)" % (SUMMARY_HEAD, len(results))
+        return [(head, _listing([v for v in values if v], line_width, max_lines))]
     res = results[0]
+    shown = [s for s in labels if fields.get(s)]
+    col_width = int(line_width / max(1, len(shown))) - 1
     cols = []
     for src, label in labels.items():
         fs = fields.get(src, [])
         if not fs:
             continue
-        if src == core.SRC_PARENT:
-            body = "\n".join("%s: %s" % (f, res.parent.get(f, "")) for f in fs)
+        label = heads.get(src, label)
+        if src in key_fields:
+            values = list(OrderedDict.fromkeys(
+                r.get(key_fields[src], "").strip() for r in res.records(src) if r.get(key_fields[src], "").strip()))
+            body = _listing(values, col_width, max_lines) if values else "(該当なし)"
+            label = "%s %s" % (label, key_fields[src])
+        elif src == core.SRC_PARENT:
+            parent = core.format_record(res.parent, wareki=True)
+            body = "\n".join("%s: %s" % (f, parent.get(f, "")) for f in fs)
         else:
             recs = res.records(src)
             body = "\n".join(_short(r, fs) for r in recs[:12]) or "(該当なし)"
@@ -305,8 +356,8 @@ def build(project, parent_layer, specs, options, base_layers, fields, labels):
             if rect.width() == 0 or rect.height() == 0:
                 rect.grow(10)
             map_item.zoomToExtent(rect)
-            if options.scale > 0:
-                map_item.setScale(options.scale)
+            # 指定が無ければ、対象が入る縮尺を切りのよい値 (1:1,000 など) に切り上げる
+            map_item.setScale(options.scale if options.scale > 0 else core.nice_scale(map_item.scale()))
 
         scale = map_item.scale()
         scale_text = "縮尺 1:{:,}".format(int(round(scale))) if scale == scale and scale > 0 else "縮尺 -"
@@ -324,12 +375,15 @@ def build(project, parent_layer, specs, options, base_layers, fields, labels):
         layout.addLayoutItem(bar)
         bar.attemptMove(QgsLayoutPoint(MARGIN + 3, map_y + map_h - 14, mm), True, False, i)
         if ov is not None:
-            legend_w = min(W - 2 * MARGIN - 60, 14 + 1.8 * len(parent_layer.name() + ov.layer.name()))
-            _legend(layout, parent_layer.name(), ov.layer.name(), options.font, i,
+            legend_w = 10 + 3.0 * len(LEGEND_PARCEL + LEGEND_OVERLAY)
+            _legend(layout, LEGEND_PARCEL, LEGEND_OVERLAY, options.font, i,
                     W - MARGIN - 3 - legend_w, map_y + map_h - 11, legend_w, 8)
 
         if options.show_info:
-            cols = info_columns(spec.results, fields, labels)
+            # 9pt の全角 1 文字 ≒ 3.3mm、1 行 ≒ 5mm (見出し行の分を除く)
+            cols = info_columns(spec.results, fields, labels, options.list_field,
+                                int((W - 2 * MARGIN - 6) / 3.3), int((info_h - 7) / 5.0),
+                                options.heads, options.key_fields)
             if cols:
                 gap = 2
                 col_w = (W - 2 * MARGIN - gap * (len(cols) - 1)) / len(cols)

@@ -3,13 +3,14 @@ import traceback
 from collections import OrderedDict
 
 from qgis.core import QgsCoordinateTransform, QgsProject, QgsRectangle, QgsVectorLayer
+from qgis.gui import QgsCollapsibleGroupBox
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QFont, QFontDatabase
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QSpinBox, QComboBox, QDialog, QFileDialog,
     QFontComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QTableWidget,
-    QTableWidgetItem, QTabWidget, QVBoxLayout,
+    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from . import core, map_print, preview, qgis_data
@@ -73,6 +74,7 @@ class MainDialog(QDialog):
         self.results = []                           # 読み込み済み全件
         self.hits = []                              # 検索結果 (Hit)
         self.rows = []                              # 表の各行 = Hit のリスト
+        self.overlay_cache = None                   # 重ねる図形の (レイヤID, キー項目, キー -> 地物ID)
 
         root = QVBoxLayout(self)
 
@@ -106,12 +108,15 @@ class MainDialog(QDialog):
         b_add.clicked.connect(self.add_condition)
         b_search = QPushButton("検索")
         b_search.clicked.connect(self.do_search)
+        b_clear = QPushButton("検索クリア")
+        b_clear.clicked.connect(self.clear_search)
         self.parent_view = QCheckBox("結果を親レイヤの行で表示")
         self.parent_view.setChecked(True)
         self.parent_view.toggled.connect(self.on_view_changed)
         h.addWidget(b_add)
         h.addWidget(self.parent_view)
         h.addStretch(1)
+        h.addWidget(b_clear)
         h.addWidget(b_search)
         v.addLayout(h)
         v.addWidget(QLabel("日付は「(日付) 以降/以前/と同じ」で指定。令和6年4月1日・R6.4.1・2024-04-01 の形式で入力できます"))
@@ -120,18 +125,25 @@ class MainDialog(QDialog):
         self.table = QTableWidget()
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.itemSelectionChanged.connect(self.on_table_selection)   # 選んだ行を地図でも選択する
         root.addWidget(self.table, 1)
         h = QHBoxLayout()
         self.status = QLabel("")
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(220)
         self.progress.setVisible(False)
+        b_all = QPushButton("全選択")
+        b_none = QPushButton("選択クリア")
         b_sel = QPushButton("地図で選択")
         b_zoom = QPushButton("選択して拡大")
+        b_all.clicked.connect(self.table.selectAll)
+        b_none.clicked.connect(self.clear_selection)
         b_sel.clicked.connect(lambda: self.select_on_map(False))
         b_zoom.clicked.connect(lambda: self.select_on_map(True))
         h.addWidget(self.status, 1)
         h.addWidget(self.progress)
+        h.addWidget(b_all)
+        h.addWidget(b_none)
         h.addWidget(b_sel)
         h.addWidget(b_zoom)
         root.addLayout(h)
@@ -140,8 +152,7 @@ class MainDialog(QDialog):
         box = QGroupBox("2. 検索レイヤ選択 (リレーション先は自動で検出し、検索時に必要な分だけ読みます)")
         form = QFormLayout(box)
         self.layer_combo = QComboBox()
-        self.related_label = QLabel("")
-        self.related_label.setWordWrap(True)
+        self.related_label = QLabel("")     # 1 行に 1 リレーション (折り返すとフォーム内で高さが足りず潰れる)
         self.selected_only = QComboBox()
         self.selected_only.addItem("全地物", False)
         self.selected_only.addItem("選択中の地物のみ", True)
@@ -150,28 +161,21 @@ class MainDialog(QDialog):
         form.addRow("対象", self.selected_only)
         root.addWidget(box)
 
-        # --- 3. 出力項目 ---
-        box = QGroupBox("3. 出力する項目")
-        v = QVBoxLayout(box)
-        self.tabs = QTabWidget()
-        self.field_lists = {}
-        v.addWidget(self.tabs)
-        h = QHBoxLayout()
-        b_all = QPushButton("全選択")
-        b_none = QPushButton("全解除")
-        b_all.clicked.connect(lambda: self.set_all_checked(True))
-        b_none.clicked.connect(lambda: self.set_all_checked(False))
-        h.addWidget(b_all)
-        h.addWidget(b_none)
-        h.addStretch(1)
-        v.addLayout(h)
-        root.addWidget(box)
-
-        # --- 4. 出力 ---
-        box = QGroupBox("4. 地図PDF出力 (表の行を選択した場合は選択行のみ、未選択なら検索結果すべて)")
-        form = QFormLayout(box)
+        # --- 3. 出力 (PDF / CSV のタブ) ---
+        # 普段は折りたたんで検索結果の表を広く使う (見出しをクリックで開く)
+        box = QgsCollapsibleGroupBox("3. 出力 (表の行を選択した場合は選択行のみ、未選択なら検索結果すべて)")
+        box.setSaveCollapsedState(False)
+        box.setCollapsed(True)
+        out = QVBoxLayout(box)
         self.only_matched = QCheckBox("リレーション先を検索した場合は、一致したレコードのみ出力する")
         self.only_matched.setChecked(True)
+        out.addWidget(self.only_matched)
+        self.out_tabs = QTabWidget()
+        out.addWidget(self.out_tabs)
+
+        # PDF タブ
+        page = QWidget()
+        form = QFormLayout(page)
         self.owner_combo = QComboBox()
         self.font_combo = QFontComboBox()
         self.font_combo.setCurrentFont(QFont(self.default_font()))
@@ -188,7 +192,7 @@ class MainDialog(QDialog):
         self.scale_spin.setSingleStep(500)
         self.scale_spin.setSpecialValueText("自動 (対象に合わせる)")
         self.scale_spin.setPrefix("1 : ")
-        self.info_check = QCheckBox("ページ下に林地台帳・森林簿などの情報を表示する")
+        self.info_check = QCheckBox("ページ下に林地台帳・森林簿などの情報を表示する (項目は CSV タブのチェックを使う)")
         self.info_check.setChecked(True)
         self.overlay_layer = QComboBox()        # 一緒に描く図形レイヤ (施業班など)
         self.overlay_key = QComboBox()          # そのレイヤのキー項目 (KEY_02 など)
@@ -200,7 +204,6 @@ class MainDialog(QDialog):
         overlay_row.addWidget(self.overlay_key, 1)
         overlay_row.addWidget(QLabel("＝"))
         overlay_row.addWidget(self.overlay_match, 2)
-        form.addRow(self.only_matched)
         form.addRow("地図の範囲", self.range_combo)
         form.addRow("用紙", self.orient_combo)
         form.addRow("縮尺", self.scale_spin)
@@ -210,6 +213,8 @@ class MainDialog(QDialog):
         form.addRow("タイトル", self.title_edit)
         form.addRow("地図ラベル・結果表に使う親レイヤの項目", self.title_field)
         form.addRow("所有者別PDFの所有者項目", self.owner_combo)
+        self.month_check = QCheckBox("所有者別PDFを月ごとのフォルダに分ける (令和8年4月/ina2026001.pdf。月は期間指定の項目の日付)")
+        form.addRow(self.month_check)
         h = QHBoxLayout()
         b_prev = QPushButton("印刷プレビュー → PDF")
         b_pdf = QPushButton("PDF 出力")
@@ -222,6 +227,33 @@ class MainDialog(QDialog):
         h.addWidget(b_pdf)
         h.addWidget(b_owner)
         form.addRow(h)
+        self.out_tabs.addTab(page, "PDF")
+
+        # CSV タブ: 出力する項目 (レイヤごとのタブ) + 文字コード
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.addWidget(QLabel("出力する項目 (CSV の列。PDF の情報欄・結果の表の列にも使います)"))
+        self.tabs = QTabWidget()
+        self.field_lists = {}
+        v.addWidget(self.tabs)
+        h = QHBoxLayout()
+        b_all = QPushButton("全選択")
+        b_none = QPushButton("全解除")
+        b_all.clicked.connect(lambda: self.set_all_checked(True))
+        b_none.clicked.connect(lambda: self.set_all_checked(False))
+        h.addWidget(b_all)
+        h.addWidget(b_none)
+        h.addStretch(1)
+        self.encoding_combo = QComboBox()
+        for k, label in core.ENCODINGS.items():
+            self.encoding_combo.addItem(label, k)
+        b_csv = QPushButton("CSV 出力")
+        b_csv.clicked.connect(self.export_csv)
+        h.addWidget(QLabel("文字コード"))
+        h.addWidget(self.encoding_combo)
+        h.addWidget(b_csv)
+        v.addLayout(h)
+        self.out_tabs.addTab(page, "CSV")
         root.addWidget(box)
 
         self.layer_combo.currentIndexChanged.connect(lambda *_: self.on_layer_changed())
@@ -247,6 +279,7 @@ class MainDialog(QDialog):
             self.layer_combo.addItem(layer.name(), layer.id())
         self.layer_combo.setCurrentIndex(max(self.layer_combo.findData(keep), 0))
         self.layer_combo.blockSignals(False)
+        self.overlay_cache = None        # 施業班などが更新されていることがあるので読み直す
         self.on_layer_changed()
         if not self.layer_combo.count():
             self.status.setText("リレーションが設定されたレイヤがありません。"
@@ -266,7 +299,8 @@ class MainDialog(QDialog):
             for n in self.names[src]:
                 union[n] = True
         self.names[core.SRC_ALL] = list(union)   # 横断検索: どのレイヤの項目名でも指定できる
-        self.related_label.setText("、".join(self.labels[r.id()] for r in self.relations) or "(なし)")
+        self.related_label.setText("\n".join(
+            "%s  (%s)" % (self.labels[r.id()], self.relation_keys(r)) for r in self.relations) or "(なし)")
 
         # 検索するレイヤの選択肢
         keep = self.source_combo.currentData()
@@ -290,7 +324,7 @@ class MainDialog(QDialog):
         self.field_lists = {}
         for src, label in self.labels.items():
             lw = QListWidget()
-            lw.setMaximumHeight(110)
+            lw.setMaximumHeight(160)
             for n in self.names[src]:
                 it = QListWidgetItem(n)
                 it.setFlags(it.flags() | ITEM_CHECKABLE)
@@ -309,6 +343,14 @@ class MainDialog(QDialog):
         self.update_overlay_layers()
         self.results, self.hits = [], []
         self.show_hits()
+
+    @staticmethod
+    def relation_keys(relation):
+        """リレーションのキーの説明。同じ項目名なら「キー: 所在KEY」、違えば「施業キー = 施業KEY」。"""
+        pairs = relation.fieldPairs()                 # {子の項目: 親の項目}
+        if all(c == p for c, p in pairs.items()):
+            return "キー: " + "、".join(pairs)
+        return "、".join("%s = %s" % (c, p) for c, p in pairs.items())
 
     def relation_ids(self):
         return [r.id() for r in self.relations]
@@ -456,6 +498,7 @@ class MainDialog(QDialog):
         counted = by_parent and src not in (core.SRC_PARENT, core.SRC_ALL)
         cols = (self.checked_fields().get(shown) or self.names.get(shown, []))[:12]
         headers = (["親レイヤ"] if not by_parent else []) + cols + (["一致件数"] if counted else [])
+        self.table.blockSignals(True)
         self.table.clear()
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
@@ -468,6 +511,7 @@ class MainDialog(QDialog):
             for c, val in enumerate(vals):
                 self.table.setItem(r, c, QTableWidgetItem(val))
         self.table.resizeColumnsToContents()
+        self.table.blockSignals(False)
         if self.hits:
             self.status.setText("検索結果: %d 件 (%s)" % (len(self.rows), self.source_combo.currentText()))
 
@@ -482,23 +526,75 @@ class MainDialog(QDialog):
             QMessageBox.information(self, TITLE, "出力対象がありません。先に検索してください。")
         return res
 
-    def select_on_map(self, zoom):
-        """検索結果の親レイヤの地物を QGIS 上で選択する (表の行を選んでいればその行だけ)。"""
-        results = core.group_hits(self.target_hits(), False)
+    def clear_search(self):
+        """検索条件・期間・結果をクリアする (地図の選択はそのまま)。"""
+        for row in self.cond_rows[1:]:
+            self.remove_condition(row)
+        first = self.cond_rows[0]
+        first.text.clear()
+        first.op.setCurrentIndex(0)
+        first.update_fields()
+        self.period_from.clear()
+        self.period_to.clear()
+        self.results, self.hits = [], []
+        self.show_hits()
+        self.status.setText("")
+
+    def overlay_index(self, ov):
+        """重ねる図形のキー -> 地物 ID (行を選ぶたびに読まないよう、一度読んだら使い回す)。"""
+        key = (ov.layer.id(), ov.key_field)
+        if self.overlay_cache is None or self.overlay_cache[0] != key:
+            self.overlay_cache = (key, qgis_data.key_index(ov.layer, ov.key_field))
+        return self.overlay_cache[1]
+
+    def select_hits_on_map(self, hits):
+        """hits の親の地物と、重ねる図形 (施業班) の地物を地図で選択する。選択したレイヤと説明文を返す。"""
+        results = core.group_hits(hits, False)
         fids = [r.fid for r in results if r.fid is not None]
-        if not fids or self.parent_layer is None:
-            QMessageBox.information(self, TITLE, "選択対象がありません。先に検索してください。")
-            return
         self.parent_layer.selectByIds(fids)
         selected = [self.parent_layer]
         msg = "%s: %d 件" % (self.parent_layer.name(), len(fids))
         ov = self.overlay()
-        if ov is not None:      # 重ねる図形 (施業班) も選択する
-            index = qgis_data.key_index(ov.layer, ov.key_field, ov.keys(results))
-            ov_fids = sorted({fid for v in index.values() for fid in v})
+        if ov is not None:
+            index = self.overlay_index(ov)
+            ov_fids = sorted({fid for k in ov.keys(results) for fid in index.get(k, [])})
             ov.layer.selectByIds(ov_fids)
             selected.append(ov.layer)
             msg += "、%s: %d 件" % (ov.layer.name(), len(ov_fids))
+        return selected, msg
+
+    def on_table_selection(self):
+        """表で選んだ行を地図でも選択する (選択が無くなったら地図の選択も外す)。"""
+        if self.parent_layer is None or not self.rows:
+            return
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        if not rows:
+            self.clear_map_selection()
+            return
+        _, msg = self.select_hits_on_map([h for r in rows for h in self.rows[r]])
+        self.status.setText("地図で選択中: " + msg)
+
+    def clear_map_selection(self):
+        layers = [self.parent_layer, self.overlay_layer_obj()]
+        for layer in layers:
+            if layer is not None:
+                layer.removeSelection()
+
+    def clear_selection(self):
+        """表と地図の選択を外す。"""
+        self.table.blockSignals(True)
+        self.table.clearSelection()
+        self.table.blockSignals(False)
+        self.clear_map_selection()
+        self.status.setText("選択をクリアしました")
+
+    def select_on_map(self, zoom):
+        """検索結果の親レイヤの地物を QGIS 上で選択する (表の行を選んでいればその行だけ)。"""
+        hits = self.target_hits()
+        if not hits or self.parent_layer is None:
+            QMessageBox.information(self, TITLE, "選択対象がありません。先に検索してください。")
+            return
+        selected, msg = self.select_hits_on_map(hits)
         if zoom:
             self.zoom_to_selected(selected)
         self.iface.messageBar().pushSuccess("地図で選択", msg + " を選択しました")
@@ -583,17 +679,38 @@ class MainDialog(QDialog):
             return None
         return map_print.Overlay(layer, self.overlay_key.currentData(), match[0], match[1])
 
+    def info_heads(self):
+        """情報欄の見出し (レイヤ名の代わりに 変更林地 / 林地台帳 / 森林簿)。"""
+        heads = {core.SRC_PARENT: "変更林地"}
+        for src, label in self.labels.items():
+            if src == core.SRC_PARENT:
+                continue
+            if "森林簿" in label:
+                heads[src] = "森林簿"
+            elif "林地台帳" in label:
+                heads[src] = "林地台帳"
+            else:
+                heads[src] = label.split(" — ")[0]
+        return heads
+
     def build_print(self, results, title=None):
         """検索結果を地図の印刷レイアウトにする。使い終わったら cleanup() を呼ぶこと。"""
         if self.parent_layer is None or not self.parent_layer.isSpatial():
             raise RuntimeError("検索レイヤに図形がないため、地図を出力できません。")
         label_field = self.title_field.currentData()
-        specs = map_print.make_specs(results, self.range_combo.currentData(),
-                                     title if title is not None else self.title_edit.text(), self.parent_label)
+        names = self.names[core.SRC_PARENT]
+        list_field = "所在KEY" if "所在KEY" in names else label_field
+        each = self.range_combo.currentData()
+        if title is None:
+            title = self.title_edit.text() if each else self.summary_title(results)
+        specs = map_print.make_specs(      # タイトルの後ろには地図ラベルの項目だけを付ける (未指定なら付けない)
+            results, each, title, lambda r: r.parent.get(label_field, "") if label_field else "")
         options = map_print.Options(
             landscape=self.orient_combo.currentData(), scale=self.scale_spin.value(),
             show_info=self.info_check.isChecked(), font=self.font_combo.currentFont().family(),
-            label_field=label_field, overlay=self.overlay())
+            label_field=label_field, overlay=self.overlay(), list_field=list_field,
+            heads=self.info_heads(), key_fields={src: "INAKEY" for src in self.labels
+                                                 if src != core.SRC_PARENT and "INAKEY" in self.names.get(src, [])})
         return map_print.build(QgsProject.instance(), self.parent_layer, specs, options,
                                self.iface.mapCanvas().layers(), self.checked_fields(), self.labels)
 
@@ -631,6 +748,28 @@ class MainDialog(QDialog):
         finally:
             built.cleanup()
 
+    def export_csv(self):
+        """検索結果を CSV に保存する。列は CSV タブでチェックした項目 (見出しは 変更林地:所在KEY など)。"""
+        res = self.target_results()
+        if not res:
+            return
+        fields = self.checked_fields()
+        if not any(fields.get(s) for s in self.labels):
+            QMessageBox.information(self, TITLE, "CSV タブで出力する項目をチェックしてください。")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "CSV 保存", "林地台帳.csv", "CSV (*.csv)")
+        if not path:
+            return
+        heads = self.info_heads()
+        labels = OrderedDict((src, heads.get(src, label)) for src, label in self.labels.items())
+        header, rows = core.csv_table(res, fields, labels)
+        try:
+            core.write_csv(path, header, rows, self.encoding_combo.currentData())
+        except OSError as e:
+            QMessageBox.critical(self, TITLE, "CSV を保存できませんでした (Excel で開いていないか確認してください):\n%s" % e)
+            return
+        self.iface.messageBar().pushSuccess("CSV 出力", "%d 件 (%d 行) を保存しました: %s" % (len(res), len(rows), path))
+
     def export_pdf(self):
         res = self.target_results()
         if not res:
@@ -654,12 +793,34 @@ class MainDialog(QDialog):
             return
         self.iface.messageBar().pushSuccess("PDF 出力", "%d 件を保存しました: %s" % (len(res), path))
 
-    def owner_name(self, results, source):
-        """届出番号で分けたときのタイトル用の氏名 (同じレイヤの 現_氏名 など)。"""
-        names = self.names.get(source, [])
-        field = next((n for n in ("現_氏名", "所有者氏名", "氏名") if n in names), None)
-        values = core.result_values(results, source, field) if field else set()
-        return "・".join(sorted(values))
+    def summary_title(self, results):
+        """まとめて 1 ページのタイトル。届出番号が 1 つならその番号、複数なら番号の範囲 (氏名は入れない)。"""
+        base = self.title_edit.text()
+        src = next((s for s in self.labels if core.NUMBER_FIELD in self.names.get(s, [])), None)
+        numbers = sorted(core.result_values(results, src, core.NUMBER_FIELD)) if src else []
+        if len(numbers) == 1:
+            return "%s %s" % (base, numbers[0])
+        if numbers:
+            return "%s %s〜%s (%d 件)" % (base, numbers[0], numbers[-1], len(numbers))
+        return base
+
+    def month_field(self):
+        """月ごとのフォルダ分けに使う日付の項目 (source, field)。期間指定の項目、無ければ届出日の項目。"""
+        data = self.period_field.currentData()
+        if data:
+            return data
+        for src in self.labels:
+            names = self.names.get(src, [])
+            hit = next((n for n in names if core.is_date_field(n) and "届出" in n), None)
+            if hit:
+                return src, hit
+        return None, None
+
+    @staticmethod
+    def month_order(label):
+        """月のフォルダ名の並び順 (日付順、日付不明は最後)。"""
+        d = core.parse_date(label + "1日") if label != core.UNKNOWN_MONTH else None
+        return (d is None, d)
 
     def export_owner_pdfs(self):
         """検索結果を所有者ごとに分け、所有者ごとに 1 つの PDF を作る。"""
@@ -678,23 +839,37 @@ class MainDialog(QDialog):
         folder = QFileDialog.getExistingDirectory(self, "所有者別PDFの保存先フォルダ")
         if not folder:
             return
+        months = {}                      # 所有者 -> 月のフォルダ名 (月ごとに分けるとき)
+        if self.month_check.isChecked():
+            src, field = self.month_field()
+            if field is None:
+                QMessageBox.information(self, TITLE, "月を決める日付の項目がありません。期間指定で日付の項目を選んでください。")
+                return
+            months = {owner: core.month_folder(core.result_values(items, src, field)) for owner, items in groups.items()}
         note = "\n(届出番号の無い %d 件は出力しません)" % skipped if skipped else ""
+        if months:
+            counts = OrderedDict()
+            for m in sorted(set(months.values()), key=self.month_order):
+                counts[m] = sum(1 for v in months.values() if v == m)
+            note += "\n\n月ごとのフォルダ:\n" + "\n".join("  %s: %d 件" % kv for kv in counts.items())
         ok = QMessageBox.question(
             self, TITLE, "%d 件分の PDF を作成します。\n保存先: %s%s\n\nよろしいですか?" % (len(groups), folder, note))
         if ok != QMessageBox.StandardButton.Yes:
             return
-        used, saved, errors = set(), 0, []
+        used, saved, errors = {}, 0, []      # フォルダごとの使用済みファイル名
         self.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             for i, (owner, items) in enumerate(groups.items(), 1):
                 self.status.setText("PDF 作成中 %d / %d: %s" % (i, len(groups), owner))
                 QApplication.processEvents()
-                path = os.path.join(folder, core.safe_filename(owner, used) + ".pdf")
+                out_dir = os.path.join(folder, core.safe_filename(months[owner])) if months else folder
+                os.makedirs(out_dir, exist_ok=True)
+                path = os.path.join(out_dir, core.safe_filename(owner, used.setdefault(out_dir, set())) + ".pdf")
                 try:
                     title = "%s %s 様" % (self.title_edit.text(), owner)
-                    if by_number:      # ファイル名は ina2026001.pdf、タイトルは「林地台帳 ina2026001 氏名 様」
-                        title = "%s %s %s 様" % (self.title_edit.text(), owner, self.owner_name(items, data[0]))
+                    if by_number:      # ファイル名は ina2026001.pdf、タイトルは「林地台帳 ina2026001」(氏名は入れない)
+                        title = "%s %s" % (self.title_edit.text(), owner)
                     built = self.build_print(items, title)
                     try:
                         err = built.export_pdf(path)

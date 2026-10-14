@@ -87,6 +87,39 @@ class CoreTest(unittest.TestCase):
         self.assertIsNone(p("12345"))                                 # 範囲外の 5 桁は日付にしない
         self.assertEqual(p("明治33年01月00日"), dt.date(1900, 1, 1))   # 日が 00
 
+    def test_format_date(self):
+        f = core.format_date
+        self.assertEqual(f("46174"), "2026/06/01")
+        self.assertEqual(f("令和8年4月13日"), "2026/04/13")
+        self.assertEqual(f("2025-09-01"), "2025/09/01")
+        self.assertEqual(f("46174", wareki=True), "令和8年6月1日")
+        self.assertEqual(f("2019-05-01", wareki=True), "令和元年5月1日")
+        self.assertEqual(f("2019-04-30", wareki=True), "平成31年4月30日")
+        self.assertEqual(f("明治33年01月00日"), "明治33年01月00日")   # 仮の値はそのまま
+        self.assertEqual(f("山林"), "山林")
+        self.assertEqual(f(""), "")
+        self.assertTrue(all(core.is_date_field(n) for n in ("現_届出", "登_届出", "地籍日", "適用日", "入力年月日")))
+        self.assertFalse(any(core.is_date_field(n) for n in ("森_林齢", "面積", "日影")))
+        h, rows = core.csv_table([core.Result(O(所在="1", 現_届出="46174", 面積="46174"))],
+                                 {core.SRC_PARENT: ["所在", "現_届出", "面積"]}, O([(core.SRC_PARENT, "林")]))
+        self.assertEqual(rows, [["1", "2026/06/01", "46174"]])     # 日付の項目だけ変換
+
+    def test_month_folder(self):
+        self.assertEqual(core.month_folder(["令和8年4月13日"]), "令和8年4月")
+        self.assertEqual(core.month_folder(["46174", "令和8年5月2日"]), "令和8年5月")   # 早い方
+        self.assertEqual(core.month_folder(["2019-05-01"]), "令和元年5月")
+        self.assertEqual(core.month_folder(["", "山林"]), core.UNKNOWN_MONTH)
+
+    def test_nice_scale(self):
+        self.assertEqual(core.nice_scale(629), 1000)
+        self.assertEqual(core.nice_scale(1909), 2000)
+        self.assertEqual(core.nice_scale(2000), 2000)
+        self.assertEqual(core.nice_scale(2600), 3000)
+        self.assertEqual(core.nice_scale(4100), 5000)
+        self.assertEqual(core.nice_scale(5200), 10000)
+        self.assertEqual(core.nice_scale(274288), 300000)
+        self.assertEqual(core.nice_scale(0), 0)
+
     def test_date_search(self):
         data = [core.Result(O(氏名="A", 更新日="令和6年4月1日")),
                 core.Result(O(氏名="B", 更新日="令和6年6月30日")),

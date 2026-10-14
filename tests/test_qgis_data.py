@@ -29,8 +29,12 @@ _qc = types.ModuleType("qgis.core")
 _qc.NULL = object()
 _qc.QgsFeatureRequest = _Req
 _qc.QgsProject = object
+_qt = types.ModuleType("qgis.PyQt.QtCore")
+_qt.QDate = _qt.QDateTime = type("QDateStub", (), {})
 sys.modules.setdefault("qgis", types.ModuleType("qgis"))
 sys.modules["qgis.core"] = _qc
+sys.modules.setdefault("qgis.PyQt", types.ModuleType("qgis.PyQt"))
+sys.modules["qgis.PyQt.QtCore"] = _qt
 
 from csv_pdf_build import core, qgis_data  # noqa: E402
 

@@ -5,6 +5,7 @@
 """
 import csv
 import datetime
+import math
 import re
 import unicodedata
 from functools import lru_cache
@@ -87,6 +88,64 @@ def parse_date(text):
         return datetime.date(year, int(mo) or 1, int(d or 0) or 1)
     except ValueError:
         return None
+
+
+# 和暦の開始日 (新しい順)
+_ERA_STARTS = [(datetime.date(2019, 5, 1), "令和"), (datetime.date(1989, 1, 8), "平成"),
+               (datetime.date(1926, 12, 25), "昭和"), (datetime.date(1912, 7, 30), "大正"),
+               (datetime.date(1868, 1, 25), "明治")]
+_ZERO_DAY_RE = re.compile(r"年\s*0*0\s*月|月\s*0*0\s*日")
+
+
+def _wareki_year(d):
+    """date -> 令和8年 (元年は「元年」)。"""
+    for start, era in _ERA_STARTS:
+        if d >= start:
+            n = d.year - start.year + 1
+            return "%s%s年" % (era, "元" if n == 1 else n)
+    return "%d年" % d.year
+
+
+def to_wareki(d):
+    """date -> 令和8年5月27日"""
+    return "%s%d月%d日" % (_wareki_year(d), d.month, d.day)
+
+
+def wareki_month(d):
+    """date -> 令和8年5月 (月ごとのフォルダ名)"""
+    return "%s%d月" % (_wareki_year(d), d.month)
+
+
+UNKNOWN_MONTH = "日付不明"
+
+
+def month_folder(values):
+    """届出日などの値から月のフォルダ名 (令和8年4月) を決める。複数あれば一番早い日、読めなければ 日付不明。"""
+    dates = [d for d in (parse_date(v) for v in values if v) if d is not None]
+    return wareki_month(min(dates)) if dates else UNKNOWN_MONTH
+
+
+def is_date_field(name):
+    """日付の項目か (現_届出・登_届出・地籍日・適用日・入力年月日 など)。"""
+    return name.endswith("日") or "届出" in name or "年月日" in name
+
+
+def format_date(value, wareki=False):
+    """日付として読める値を 2026/05/27 (wareki=True なら 令和8年5月27日) にする。
+
+    読めない値や、日・月が 00 の仮の値 (明治33年01月00日) は元のまま返す。
+    """
+    if not value or _ZERO_DAY_RE.search(unicodedata.normalize("NFKC", value)):
+        return value
+    d = parse_date(value)
+    if d is None:
+        return value
+    return to_wareki(d) if wareki else d.strftime("%Y/%m/%d")
+
+
+def format_record(rec, wareki=False):
+    """レコードの日付の項目だけを format_date で整えたコピー。"""
+    return OrderedDict((k, format_date(v, wareki) if is_date_field(k) else v) for k, v in rec.items())
 
 
 def condition_error(conditions):
@@ -262,7 +321,7 @@ def csv_table(results, fields, labels):
 
     labels は {source: 表示名} (親が先頭、以降がリレーション先の順)。
     1 つの親に対し、リレーション先の最大件数だけ行を出力する
-    (親の項目は各行に繰り返し、足りない側は空欄)。
+    (親の項目は各行に繰り返し、足りない側は空欄)。日付の項目は 2026/05/27 の形にする。
     """
     sources = [s for s in labels if fields.get(s)]
     header = ["%s:%s" % (labels[s], f) for s in sources for f in fields[s]]
@@ -277,7 +336,7 @@ def csv_table(results, fields, labels):
                 else:
                     recs = res.records(s)
                     rec = recs[i] if i < len(recs) else {}
-                row += [rec.get(f, "") for f in fields[s]]
+                row += [format_date(rec.get(f, "")) if is_date_field(f) else rec.get(f, "") for f in fields[s]]
             rows.append(row)
     return header, rows
 
@@ -330,6 +389,20 @@ def build_html(results, fields, labels, title="林地台帳 出力", font_family
                 parts.append("<br>")
     parts.append("</body></html>")
     return "".join(parts)
+
+
+NICE_SCALES = (1, 1.5, 2, 2.5, 3, 5)
+
+
+def nice_scale(scale):
+    """scale 以上で最も小さい切りのよい縮尺 (1, 1.5, 2, 2.5, 3, 5 の 10 倍ずつ)。629 -> 1000"""
+    if not scale or scale <= 0 or scale != scale:
+        return scale
+    step = 10 ** math.floor(math.log10(scale))
+    for m in NICE_SCALES + (10,):
+        if m * step >= scale - 1e-6:
+            return m * step
+    return 10 * step
 
 
 NUMBER_FIELD = "届出番号"   # 所有者別PDFをこの項目で分けると ina2026001.pdf のように保存する
