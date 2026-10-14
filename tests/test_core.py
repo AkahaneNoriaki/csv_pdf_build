@@ -87,6 +87,27 @@ class CoreTest(unittest.TestCase):
         self.assertIsNotNone(core.condition_error([cond("更新日", "date_from", "あ")]))
         self.assertIsNone(core.condition_error(rng))
 
+    def test_group_by_owner_parent_and_relation(self):
+        g = core.group_by_owner(sample(), core.SRC_PARENT, "所有者")
+        self.assertEqual(list(g), ["山田 太郎", "鈴木 花子"])
+        g = core.group_by_owner(sample(), D, "氏名")
+        self.assertEqual(list(g), ["山田 太郎", "鈴木 花子", "佐藤 次郎"])
+        # 鈴木の親は詳細が 2 件 (鈴木/佐藤) -> 所有者ごとに詳細 1 件へ絞られる
+        self.assertEqual([len(r.children[D]) for r in g["佐藤 次郎"]], [1])
+        self.assertEqual(g["佐藤 次郎"][0].children[D][0]["地目"], "山林")
+        # 森林簿など他レイヤはそのまま
+        self.assertEqual(len(g["山田 太郎"][0].children[F]), 2)
+
+    def test_group_unknown_owner(self):
+        data = [core.Result(O(所有者=""), {})]
+        self.assertEqual(list(core.group_by_owner(data, core.SRC_PARENT, "所有者")), [core.UNKNOWN_OWNER])
+
+    def test_safe_filename(self):
+        used = set()
+        self.assertEqual(core.safe_filename("山田/太郎:様", used), "山田_太郎_様")
+        self.assertEqual(core.safe_filename("山田_太郎_様", used), "山田_太郎_様_2")
+        self.assertEqual(core.safe_filename("  ", used), "名称なし")
+
     def test_html(self):
         f = {core.SRC_PARENT: ["地番"], F: ["樹種"]}
         html = core.build_html(sample(), f, LABELS, title_field="地番")

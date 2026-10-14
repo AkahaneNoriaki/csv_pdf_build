@@ -264,3 +264,47 @@ def build_html(results, fields, labels, title="林地台帳 出力", font_family
                 parts.append("<br>")
     parts.append("</body></html>")
     return "".join(parts)
+
+
+UNKNOWN_OWNER = "(所有者不明)"
+
+
+def group_by_owner(results, source, field):
+    """所有者(source のレイヤの field の値)ごとに Result をまとめる。
+
+    source が親なら親レコードの値で分ける。リレーション先なら、その値を持つ
+    子レコードだけに絞った Result を所有者ごとに作る (1 つの親が複数の所有者に
+    属することがある)。戻り値は OrderedDict[所有者名 -> [Result]]。
+    """
+    groups = OrderedDict()
+    for res in results:
+        if source == SRC_PARENT:
+            owner = res.parent.get(field, "").strip() or UNKNOWN_OWNER
+            groups.setdefault(owner, []).append(res)
+            continue
+        recs = res.records(source)
+        owners = OrderedDict()
+        for rec in recs:
+            owners.setdefault(rec.get(field, "").strip() or UNKNOWN_OWNER, []).append(rec)
+        if not owners:
+            groups.setdefault(UNKNOWN_OWNER, []).append(res)
+        for owner, owner_recs in owners.items():
+            children = dict(res.children)
+            children[source] = owner_recs
+            narrowed = Result(res.parent, children)
+            narrowed.fid = res.fid
+            groups.setdefault(owner, []).append(narrowed)
+    return groups
+
+
+def safe_filename(name, used=None, limit=80):
+    """ファイル名に使えない文字を置き換える。used を渡すと重複に連番を付ける。"""
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", name).strip(" .") or "名称なし"
+    s = s[:limit]
+    if used is not None:
+        base, n = s, 2
+        while s.casefold() in used:
+            s = "%s_%d" % (base, n)
+            n += 1
+        used.add(s.casefold())
+    return s

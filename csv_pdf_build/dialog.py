@@ -1,3 +1,4 @@
+import os
 import traceback
 from collections import OrderedDict
 
@@ -17,6 +18,7 @@ ITEM_CHECKABLE = Qt.ItemFlag.ItemIsUserCheckable
 CHECKED = Qt.CheckState.Checked
 UNCHECKED = Qt.CheckState.Unchecked
 ALL_FIELDS = "(全項目)"
+PREVIEW_LIMIT = 10   # 印刷プレビューに表示する最大件数 (全件だと重く応答しなくなる)
 TITLE = "林地台帳 CSV/PDF 出力"
 
 
@@ -50,6 +52,9 @@ class ConditionRow(QHBoxLayout):
         self.field.addItem(ALL_FIELDS, None)
         for n in self.dialog.names.get(self.dialog.search_source(), []):
             self.field.addItem(n, n)
+        first = not self.dialog.cond_rows or self.dialog.cond_rows[0] is self
+        if first and self.field.findData("氏名") >= 0:
+            self.field.setCurrentIndex(self.field.findData("氏名"))   # 先頭の条件は氏名を既定にする
 
     def condition(self):
         return core.Condition(self.field.currentData(), self.op.currentData(), self.text.text())
@@ -82,6 +87,20 @@ class MainDialog(QDialog):
         self.cond_layout = QVBoxLayout()
         self.cond_rows = []
         v.addLayout(self.cond_layout)
+        h = QHBoxLayout()
+        h.addWidget(QLabel("期間指定"))
+        self.period_field = QComboBox()
+        self.period_from = QLineEdit()
+        self.period_from.setPlaceholderText("開始日 (例: 令和6年4月1日)")
+        self.period_to = QLineEdit()
+        self.period_to.setPlaceholderText("終了日 (例: 令和6年6月30日)")
+        for w in (self.period_from, self.period_to):
+            w.returnPressed.connect(self.do_search)
+        h.addWidget(self.period_field, 1)
+        h.addWidget(self.period_from, 2)
+        h.addWidget(QLabel("〜"))
+        h.addWidget(self.period_to, 2)
+        v.addLayout(h)
         h = QHBoxLayout()
         b_add = QPushButton("条件を追加")
         b_add.clicked.connect(self.add_condition)
@@ -153,29 +172,27 @@ class MainDialog(QDialog):
         form = QFormLayout(box)
         self.only_matched = QCheckBox("リレーション先を検索した場合は、一致したレコードのみ出力する")
         self.only_matched.setChecked(True)
-        self.enc_combo = QComboBox()
-        for k, v_ in core.ENCODINGS.items():
-            self.enc_combo.addItem(v_, k)
+        self.owner_combo = QComboBox()
         self.font_combo = QFontComboBox()
         self.font_combo.setCurrentFont(QFont(self.default_font()))
         self.title_edit = QLineEdit("林地台帳 出力")
         self.title_field = QComboBox()
         form.addRow(self.only_matched)
-        form.addRow("CSV 文字コード", self.enc_combo)
         form.addRow("PDF フォント", self.font_combo)
         form.addRow("PDF タイトル", self.title_edit)
         form.addRow("PDF 見出し・結果表に使う親レイヤの項目", self.title_field)
+        form.addRow("所有者別PDFの所有者項目", self.owner_combo)
         h = QHBoxLayout()
-        b_csv = QPushButton("CSV 出力")
         b_prev = QPushButton("印刷プレビュー → PDF")
         b_pdf = QPushButton("PDF 出力")
-        b_csv.clicked.connect(self.export_csv)
+        b_owner = QPushButton("所有者別PDFを作成")
         b_prev.clicked.connect(self.preview_pdf)
         b_pdf.clicked.connect(self.export_pdf)
+        b_owner.clicked.connect(self.export_owner_pdfs)
         h.addStretch(1)
-        h.addWidget(b_csv)
         h.addWidget(b_prev)
         h.addWidget(b_pdf)
+        h.addWidget(b_owner)
         form.addRow(h)
         root.addWidget(box)
 
@@ -223,10 +240,11 @@ class MainDialog(QDialog):
         keep = self.source_combo.currentData()
         self.source_combo.blockSignals(True)
         self.source_combo.clear()
-        self.source_combo.addItem("すべてのレイヤを横断 (氏名など)", core.SRC_ALL)
         for src, label in self.labels.items():
-            prefix = "親: " if src == core.SRC_PARENT else "リレーション先: "
-            self.source_combo.addItem(prefix + label, src)
+            if src != core.SRC_PARENT:
+                self.source_combo.addItem("リレーション先: " + label, src)
+        self.source_combo.addItem("親: " + self.labels[core.SRC_PARENT], core.SRC_PARENT)
+        self.source_combo.addItem("すべてのレイヤを横断", core.SRC_ALL)
         i = self.source_combo.findData(keep)
         self.source_combo.setCurrentIndex(max(i, 0))
         self.source_combo.blockSignals(False)
@@ -250,8 +268,33 @@ class MainDialog(QDialog):
             self.title_field.addItem(n, n)
         for row in self.cond_rows:
             row.update_fields()
+        self.update_period_fields()
+        self.update_owner_combo()
         self.results, self.hits = [], []
         self.show_hits()
+
+    def update_period_fields(self):
+        """期間指定の日付項目。入力年月日・更新日などを既定にする。"""
+        self.period_field.clear()
+        self.period_field.addItem(ALL_FIELDS, None)
+        for n in self.names.get(self.search_source(), []):
+            self.period_field.addItem(n, n)
+        for key in ("入力年月日", "年月日", "更新日", "日"):
+            hit = next((i for i in range(self.period_field.count())
+                        if key in (self.period_field.itemData(i) or "")), -1)
+            if hit >= 0:
+                self.period_field.setCurrentIndex(hit)
+                break
+
+    def current_conditions(self):
+        """条件行 + 期間指定 (開始日以降・終了日以前) をまとめた検索条件。"""
+        conds = [r.condition() for r in self.cond_rows]
+        field = self.period_field.currentData()
+        if self.period_from.text().strip():
+            conds.append(core.Condition(field, "date_from", self.period_from.text().strip()))
+        if self.period_to.text().strip():
+            conds.append(core.Condition(field, "date_to", self.period_to.text().strip()))
+        return conds
 
     def search_source(self):
         return self.source_combo.currentData() or core.SRC_ALL
@@ -259,6 +302,7 @@ class MainDialog(QDialog):
     def on_source_changed(self, *_):
         for row in self.cond_rows:
             row.update_fields()
+        self.update_period_fields()
         self.hits = []
         self.show_hits()
 
@@ -296,7 +340,7 @@ class MainDialog(QDialog):
         if self.parent_layer is None:
             QMessageBox.warning(self, TITLE, "リレーション済みのレイヤを選択してください。")
             return
-        conds = [r.condition() for r in self.cond_rows]
+        conds = self.current_conditions()
         err = core.condition_error(conds)
         if err:
             QMessageBox.warning(self, TITLE, err)
@@ -392,23 +436,22 @@ class MainDialog(QDialog):
         self.iface.messageBar().pushSuccess("地図で選択", "%s: %d 件を選択しました" % (self.parent_layer.name(), len(fids)))
 
     # ---------- 出力 ----------
-    def export_csv(self):
-        res = self.target_results()
-        if not res:
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "CSV 保存", "林地台帳.csv", "CSV (*.csv)")
-        if not path:
-            return
-        header, rows = core.csv_table(res, self.checked_fields(), self.labels)
-        try:
-            core.write_csv(path, header, rows, self.enc_combo.currentData())
-        except OSError as e:
-            QMessageBox.critical(self, TITLE, "保存に失敗しました:\n%s" % e)
-            return
-        self.iface.messageBar().pushSuccess("CSV 出力", "%d 行を保存しました: %s" % (len(rows), path))
+    def update_owner_combo(self):
+        """所有者別PDFで分ける項目 (親・リレーション先の全項目から選ぶ)。"""
+        self.owner_combo.clear()
+        for src, label in self.labels.items():
+            for n in self.names[src]:
+                self.owner_combo.addItem("%s: %s" % (label, n), (src, n))
+        for key in ("所有者", "氏名"):
+            hit = next((i for i in range(self.owner_combo.count())
+                        if key in self.owner_combo.itemData(i)[1]), -1)
+            if hit >= 0:
+                self.owner_combo.setCurrentIndex(hit)
+                break
 
-    def build_document(self, res):
-        html = core.build_html(res, self.checked_fields(), self.labels, self.title_edit.text(),
+    def build_document(self, res, title=None):
+        html = core.build_html(res, self.checked_fields(), self.labels,
+                               title if title is not None else self.title_edit.text(),
                                self.font_combo.currentFont().family(), self.title_field.currentData())
         doc = QTextDocument()
         doc.setDefaultFont(self.font_combo.currentFont())
@@ -416,11 +459,20 @@ class MainDialog(QDialog):
         return doc
 
     def preview_pdf(self):
-        """検索結果(親レイヤ+リレーション先)の印刷プレビューを開き、そこから PDF 保存する。"""
+        """印刷プレビューを開き、そこから PDF 保存する。
+
+        プレビューは重いので先頭 PREVIEW_LIMIT 件だけ表示し、保存時に全件を出力する。
+        """
         res = self.target_results()
         if not res:
             return
-        dlg = preview.PreviewDialog(self.build_document(res), len(res), parent=self)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            doc = self.build_document(res[:PREVIEW_LIMIT])
+        finally:
+            QApplication.restoreOverrideCursor()
+        dlg = preview.PreviewDialog(doc, min(len(res), PREVIEW_LIMIT), len(res),
+                                    lambda: self.build_document(res), parent=self)
         if dlg.exec() and dlg.saved_path:
             self.iface.messageBar().pushSuccess("PDF 出力", "%d 件を保存しました: %s" % (len(res), dlg.saved_path))
 
@@ -431,5 +483,49 @@ class MainDialog(QDialog):
         path, _ = QFileDialog.getSaveFileName(self, "PDF 保存", "林地台帳.pdf", "PDF (*.pdf)")
         if not path:
             return
-        preview.print_doc(self.build_document(res), preview.make_printer(path))
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            preview.print_doc(self.build_document(res), preview.make_printer(path))
+        finally:
+            QApplication.restoreOverrideCursor()
         self.iface.messageBar().pushSuccess("PDF 出力", "%d 件を保存しました: %s" % (len(res), path))
+
+    def export_owner_pdfs(self):
+        """検索結果を所有者ごとに分け、所有者ごとに 1 つの PDF を作る。"""
+        data = self.owner_combo.currentData()
+        res = self.target_results() if data else []
+        if not data:
+            QMessageBox.information(self, TITLE, "所有者の項目を選択してください。")
+        if not res:
+            return
+        groups = core.group_by_owner(res, data[0], data[1])
+        folder = QFileDialog.getExistingDirectory(self, "所有者別PDFの保存先フォルダ")
+        if not folder:
+            return
+        ok = QMessageBox.question(
+            self, TITLE, "%d 人分の PDF を作成します。\n保存先: %s\n\nよろしいですか?" % (len(groups), folder))
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+        used, saved, errors = set(), 0, []
+        self.setEnabled(False)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            for i, (owner, items) in enumerate(groups.items(), 1):
+                self.status.setText("PDF 作成中 %d / %d: %s" % (i, len(groups), owner))
+                QApplication.processEvents()
+                path = os.path.join(folder, core.safe_filename(owner, used) + ".pdf")
+                try:
+                    doc = self.build_document(items, "%s %s 様" % (self.title_edit.text(), owner))
+                    preview.print_doc(doc, preview.make_printer(path))
+                    saved += 1
+                except Exception as e:  # 1 人分の失敗で全体を止めない
+                    errors.append("%s: %s" % (owner, e))
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.setEnabled(True)
+        msg = "%d / %d 人分の PDF を保存しました: %s" % (saved, len(groups), folder)
+        self.status.setText(msg)
+        if errors:
+            QMessageBox.warning(self, TITLE, msg + "\n\n失敗:\n" + "\n".join(errors[:20]))
+        else:
+            self.iface.messageBar().pushSuccess("所有者別PDF", msg)
