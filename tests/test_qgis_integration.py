@@ -139,7 +139,7 @@ class IntegrationTest(unittest.TestCase):
             built.cleanup()
 
         folder = tempfile.mkdtemp()
-        QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: folder)
+        dlg.out_dir_edit.setText(folder)   # 保存先は欄から取る (set_out_dir だと QgsSettings に残るので使わない)
         QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes)
         dlg.owner_combo.setCurrentIndex(next(i for i in range(dlg.owner_combo.count())
                                              if dlg.owner_combo.itemText(i).endswith("氏名")))
