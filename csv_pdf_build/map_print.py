@@ -282,7 +282,7 @@ def _legend(layout, parent_name, overlay_name, font, page, x, y, w, h):
     label.setText('<div style="font-family:\'%s\'; font-size:9pt;">%s&nbsp;&nbsp;%s</div>'
                   % (escape(font, quote=True), item % (PARCEL_COLOR + (escape(parent_name),)),
                      item % (OVERLAY_COLOR + (escape(overlay_name),))))
-    label.setBackgroundEnabled(True)
+    label.setBackgroundEnabled(False)
     label.setFrameEnabled(True)
     if hasattr(label, "setMarginX"):
         label.setMarginX(1.5)
@@ -368,7 +368,7 @@ def build(project, parent_layer, specs, options, base_layers, fields, labels):
         north = QgsLayoutItemPicture(layout)
         north.setPicturePath(":/images/north_arrows/layout_default_north_arrow.svg")
         north.setLinkedMap(map_item)         # 地図の回転に追従する
-        north.setBackgroundEnabled(True)
+        north.setBackgroundEnabled(False)
         layout.addLayoutItem(north)
         _place(north, i, W - MARGIN - 3 - NORTH_SIZE, map_y + 3, NORTH_SIZE, NORTH_SIZE)
 
@@ -378,7 +378,7 @@ def build(project, parent_layer, specs, options, base_layers, fields, labels):
         bar.setNumberOfSegments(2)
         bar.setNumberOfSegmentsLeft(0)
         bar.setStyle("Single Box")
-        bar.setBackgroundEnabled(True)
+        bar.setBackgroundEnabled(False)
         bar.applyDefaultSize(project.crs().mapUnits())
         layout.addLayoutItem(bar)
         bar.attemptMove(QgsLayoutPoint(MARGIN + 3, map_y + map_h - 14, mm), True, False, i)
