@@ -33,6 +33,7 @@
 - 地図の範囲: 「1筆ごとに1ページ」または「検索結果をまとめて1ページ」。用紙は A4 横/縦、縮尺は自動(1:1,000・1:2,500 など切りのよい値に切り上げ)または 1:◯◯ を指定
 - ページ下の情報欄に【変更林地】【林地台帳】【森林簿 INAKEY】を表示(森林簿は INAKEY の値だけを重複なしで表示。オフにもできます)。まとめページは【変更林地一覧 (N 件)】として所在KEY を並べ、入りきらない分は「…他 N 件」
 - タイトル: 1筆ごとは「林地台帳」、まとめページは届出番号(1つならその番号、複数なら ina2026001〜ina2026043 (43 件))。凡例は「林地」「森林」
+- 方位記号: 地図の右上に北矢印を表示(地図を回転した場合は連動)
 - 印刷プレビュー → PDF: プリンタを使わず1ページずつ表示(先頭10ページのみ描画)。保存は全ページ
 - PDF 出力: 全ページを1つの PDF に保存
 - 所有者別PDFを作成: 所有者の項目(リレーション先の氏名など)で分け、フォルダに「所有者名.pdf」を1人1ファイルで作成
@@ -45,3 +46,10 @@
 ## テスト
 - 通常: `python3 -m unittest discover -s tests`(QGIS 不要。QGIS 用のテストは自動でスキップ)
 - QGIS 込み: `QT_QPA_PLATFORM=offscreen /usr/bin/python3.12 -m unittest tests.test_qgis_integration`(python3-qgis が必要。検索 → 地図 → PDF を通しで実行)
+- macOS で QGIS.app 同梱の Python を使う場合(標準ライブラリが `python3.11` フォルダにあるため環境変数が必要):
+  ```
+  R=/Applications/QGIS.app/Contents/Resources
+  QT_QPA_PLATFORM=offscreen PROJ_LIB=$R/qgis/proj QGIS_PREFIX_PATH=$R/qgis PYTHONHOME=$R \
+  PYTHONPATH=$R/python3.11:$R/python3.11/lib-dynload:$R/python3.11/site-packages:$R/python \
+  /Applications/QGIS.app/Contents/MacOS/python -m unittest tests.test_qgis_integration
+  ```

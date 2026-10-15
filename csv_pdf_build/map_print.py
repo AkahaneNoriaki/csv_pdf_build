@@ -10,7 +10,7 @@ from html import escape
 
 from qgis.core import (
     QgsCoordinateTransform, QgsFeature, QgsFeatureRequest, QgsFillSymbol, QgsLayoutExporter,
-    QgsLayoutItemLabel, QgsLayoutItemMap, QgsLayoutItemPage, QgsLayoutItemScaleBar, QgsLayoutPoint,
+    QgsLayoutItemLabel, QgsLayoutItemMap, QgsLayoutItemPage, QgsLayoutItemPicture, QgsLayoutItemScaleBar, QgsLayoutPoint,
     QgsLayoutSize, QgsLineSymbol, QgsMarkerSymbol, QgsPalLayerSettings, QgsPrintLayout, QgsProject,
     QgsRectangle, QgsSingleSymbolRenderer, QgsTextBufferSettings, QgsTextFormat, QgsUnitTypes,
     QgsVectorLayer, QgsVectorLayerSimpleLabeling, QgsWkbTypes,
@@ -23,6 +23,7 @@ from . import core, qgis_data
 MARGIN = 10          # 用紙の余白 (mm)
 TITLE_H = 9          # タイトル行の高さ
 INFO_H = 42          # 情報欄の高さ
+NORTH_SIZE = 14      # 方位記号の大きさ (mm)
 EXTENT_MARGIN = 2.0  # 対象範囲の周囲に取る余白の倍率 (周りの筆も見えるようにする)
 
 
@@ -363,6 +364,13 @@ def build(project, parent_layer, specs, options, base_layers, fields, labels):
         scale_text = "縮尺 1:{:,}".format(int(round(scale))) if scale == scale and scale > 0 else "縮尺 -"
         _label(layout, scale_text,
                options.font, 10, i, W - MARGIN - 52, MARGIN, 52, TITLE_H)
+
+        north = QgsLayoutItemPicture(layout)
+        north.setPicturePath(":/images/north_arrows/layout_default_north_arrow.svg")
+        north.setLinkedMap(map_item)         # 地図の回転に追従する
+        north.setBackgroundEnabled(True)
+        layout.addLayoutItem(north)
+        _place(north, i, W - MARGIN - 3 - NORTH_SIZE, map_y + 3, NORTH_SIZE, NORTH_SIZE)
 
         bar = QgsLayoutItemScaleBar(layout)
         bar.setLinkedMap(map_item)
