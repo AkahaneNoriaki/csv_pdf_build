@@ -20,6 +20,15 @@ from qgis.PyQt.QtGui import QColor, QFont
 
 from . import core, qgis_data
 
+# QGIS 3.x (QgsWkbTypes) / QGIS 3.30+・4 (Qgis.GeometryType) 両対応
+try:
+    from qgis.core import Qgis
+    _GEOM_POLYGON = Qgis.GeometryType.Polygon
+    _GEOM_LINE = Qgis.GeometryType.Line
+except (ImportError, AttributeError):
+    _GEOM_POLYGON = QgsWkbTypes.PolygonGeometry
+    _GEOM_LINE = QgsWkbTypes.LineGeometry
+
 MARGIN = 10          # 用紙の余白 (mm)
 TITLE_H = 9          # タイトル行の高さ
 INFO_H = 42          # 情報欄の高さ
@@ -104,12 +113,12 @@ class Built:
         settings = QgsLayoutExporter.PdfExportSettings()
         settings.dpi = 200
         result = exporter.exportToPdf(path, settings)
-        if result == QgsLayoutExporter.Success:
+        if result == QgsLayoutExporter.ExportResult.Success:
             return None
-        return {QgsLayoutExporter.FileError: "ファイルに書き込めません (他で開いていないか確認してください)",
-                QgsLayoutExporter.MemoryError: "メモリ不足です (用紙数を減らしてください)",
-                QgsLayoutExporter.PrintError: "出力に失敗しました",
-                QgsLayoutExporter.SvgLayerError: "出力に失敗しました"}.get(result, "出力に失敗しました (コード %s)" % result)
+        return {QgsLayoutExporter.ExportResult.FileError: "ファイルに書き込めません (他で開いていないか確認してください)",
+                QgsLayoutExporter.ExportResult.MemoryError: "メモリ不足です (用紙数を減らしてください)",
+                QgsLayoutExporter.ExportResult.PrintError: "出力に失敗しました",
+                QgsLayoutExporter.ExportResult.SvgLayerError: "出力に失敗しました"}.get(result, "出力に失敗しました (コード %s)" % result)
 
     def cleanup(self):
         for layer in self.temp_layers:
@@ -127,11 +136,11 @@ SUMMARY_HEAD = "変更林地一覧"  # まとめページの情報欄の見出�
 
 def _symbol(gtype, overlay):
     r, g, b = OVERLAY_COLOR if overlay else PARCEL_COLOR
-    if gtype == QgsWkbTypes.PolygonGeometry:
+    if gtype == _GEOM_POLYGON:
         fill = "%d,%d,%d,40" % (r, g, b) if overlay else "255,235,0,90"
         return QgsFillSymbol.createSimple({"color": fill, "outline_color": "%d,%d,%d,255" % (r, g, b),
                                            "outline_width": "0.6" if overlay else "0.8"})
-    if gtype == QgsWkbTypes.LineGeometry:
+    if gtype == _GEOM_LINE:
         return QgsLineSymbol.createSimple({"color": "%d,%d,%d,255" % (r, g, b), "width": "1.2"})
     return QgsMarkerSymbol.createSimple({"name": "circle", "color": "%d,%d,%d,255" % (r, g, b), "size": "3"})
 
@@ -277,7 +286,7 @@ def _label(layout, text, font, size, page, x, y, w, h, frame=False, valign=Qt.Al
 def _legend(layout, parent_name, overlay_name, font, page, x, y, w, h):
     """地図の右下に置く凡例 (色の四角 + レイヤ名)。"""
     label = QgsLayoutItemLabel(layout)
-    label.setMode(QgsLayoutItemLabel.ModeHtml)
+    label.setMode(QgsLayoutItemLabel.Mode.ModeHtml)
     item = '<span style="color:rgb(%d,%d,%d)">■</span> %s'
     label.setText('<div style="font-family:\'%s\'; font-size:9pt;">%s&nbsp;&nbsp;%s</div>'
                   % (escape(font, quote=True), item % (PARCEL_COLOR + (escape(parent_name),)),

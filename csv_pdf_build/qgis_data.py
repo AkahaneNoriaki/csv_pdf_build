@@ -45,9 +45,13 @@ def _key(feature, names):
 
 def _request():
     """ジオメトリを読まない地物リクエスト (検索には不要で、読むと遅くなる)。"""
-    flag = getattr(QgsFeatureRequest, "NoGeometry", None)
+    flag = getattr(QgsFeatureRequest, "NoGeometry", None)   # QGIS 3.x
     if flag is None:
-        flag = QgsFeatureRequest.Flag.NoGeometry
+        try:                                                  # QGIS 3.36+ / QGIS 4
+            from qgis.core import Qgis
+            flag = Qgis.FeatureRequestFlag.NoGeometry
+        except (ImportError, AttributeError):
+            flag = QgsFeatureRequest.Flag.NoGeometry
     return QgsFeatureRequest().setFlags(flag)
 
 

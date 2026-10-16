@@ -1,6 +1,7 @@
 [general]
 name=林地台帳 CSV/PDF 出力
 qgisMinimumVersion=3.16
+supportsQt6=True
 description=リレーションされた林地台帳レイヤと Excel(林地台帳詳細・森林簿詳細)を検索し、CSV/PDF に出力します
 version=0.1.0
 author=akahanenoriaki
